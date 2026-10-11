@@ -9,7 +9,7 @@ import SimpleCmd (cmdFull, needProgram)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
-import System.Environment (lookupEnv)
+import System.Environment (getEnvironment, lookupEnv)
 import System.FilePath (isAbsolute, normalise, splitDirectories)
 import System.Posix.Process (executeFile)
 
@@ -69,10 +69,11 @@ prepare opts = do
     invalid "duplicate volume destinations"
   mapM_ (validateMount (shareFilesystem opts) project home) mounts
   env <- mapM resolveEnvironment (environmentOptions opts)
+  locale <- filter (isLocaleVariable . fst) <$> getEnvironment
   term <- fromMaybe "dumb" <$> lookupEnv "TERM"
   let homeArgs = maybe ["--tmpfs", home]
         (\path -> ["--bind", path, home]) suppliedHome
-      defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term)]
+      defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term)] ++ locale
       cmd = if null (command opts)
         then ["/bin/bash"] else command opts
       args = ["--die-with-parent"] ++ filesystem
@@ -105,6 +106,9 @@ verifyProcessIsolation = do
 
 systemPath :: String
 systemPath = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
+isLocaleVariable :: String -> Bool
+isLocaleVariable key = key == "LANG" || key == "LANGUAGE" || "LC_" `isPrefixOf` key
 
 temporaryRoots :: [FilePath]
 temporaryRoots = ["/home", "/root", "/tmp", "/run"]
