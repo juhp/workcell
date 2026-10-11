@@ -3,7 +3,7 @@ module Workcell (Options(..), runWorkcell) where
 
 import Control.Monad (forM, unless, when)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
-import Data.List (isPrefixOf, nub)
+import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (fromMaybe)
 import SimpleCmd (cmdFull, needProgram)
 import System.Directory
@@ -73,7 +73,7 @@ prepare opts = do
   term <- fromMaybe "dumb" <$> lookupEnv "TERM"
   let homeArgs = maybe ["--tmpfs", home]
         (\path -> ["--bind", path, home]) suppliedHome
-      defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term),
+      defaults = [("HOME", home), ("PATH", defaultPath home), ("TERM", term),
                   ("WORKCELL_ACTIVE", "1")] ++ locale
       cmd = if null (command opts)
         then ["/bin/bash"] else command opts
@@ -105,8 +105,10 @@ verifyProcessIsolation = do
     "private PID namespace and /proc are unavailable in this environment. "
     ++ "Use --share-processes only if sharing enclosing processes is acceptable.\n" ++ err
 
-systemPath :: String
-systemPath = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+defaultPath :: FilePath -> String
+defaultPath home = intercalate ":"
+  [home </> ".local/bin", home </> "bin",
+   "/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"]
 
 isLocaleVariable :: String -> Bool
 isLocaleVariable key = key == "LANG" || key == "LANGUAGE" || "LC_" `isPrefixOf` key
