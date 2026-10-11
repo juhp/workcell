@@ -46,13 +46,25 @@ must not overlap the project or cover the isolated home; volumes beneath home ar
 allowed. Duplicate destinations and file/directory type mismatches are rejected.
 
 The environment is cleared except for a system `PATH`, selected `HOME`, `TERM`,
-and inherited locale settings (`LANG`, `LANGUAGE`, and `LC_*`). This lets programs
+`WORKCELL_ACTIVE=1`, and inherited locale settings (`LANG`, `LANGUAGE`, and `LC_*`). This lets programs
 such as tmux detect UTF-8 before starting a shell. Unset locale variables remain
 unset; workcell does not choose a locale on your behalf.
 Repeatable `-e/--env KEY` passes through an existing variable (an unset variable is
 an error); `KEY=VALUE` sets it, including empty values. Later entries override
 earlier entries and defaults. Home-installed tools need an explicit mount and,
 if necessary, a supplied `PATH`.
+
+Use `WORKCELL_ACTIVE` to detect workcell in your shell configuration. For example,
+add this after setting `PS1` in the `.bashrc` used by your workcell home:
+
+```bash
+if [[ ${WORKCELL_ACTIVE:-} == 1 ]]; then
+    PS1="[workcell] $PS1"
+fi
+```
+
+With the default empty home, mount your Bash configuration explicitly (for
+example, `workcell -v ~/.bashrc`) or use a persistent home with `--home`.
 
 Options precede the command. Use `--` to separate command arguments; those
 arguments are passed directly without shell expansion. Without a command,

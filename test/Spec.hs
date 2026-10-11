@@ -173,11 +173,13 @@ spec = describe "workcell CLI" $ do
 
   it "clears other environment variables and applies explicit overrides" $ \ctx -> do
     environment <- getEnvironment
-    let supplied = setVariables [("WORKCELL_TEST_SECRET", "hidden"), ("WORKCELL_TEST_PASS", "passed")] environment
+    let supplied = setVariables [("WORKCELL_TEST_SECRET", "hidden"), ("WORKCELL_TEST_PASS", "passed"),
+                                 ("WORKCELL_ACTIVE", "outside")] environment
     _ <- successful =<< invoke ctx Nothing (Just supplied)
       ["-e", "WORKCELL_TEST_PASS", "-e", "WORKCELL_TEST_VALUE=first", "-e", "WORKCELL_TEST_VALUE=last=part",
        "-e", "WORKCELL_TEST_EMPTY=", "--", "/bin/sh", "-c", unlines
-       ["set -eu", "[ -z \"${WORKCELL_TEST_SECRET+x}\" ]", "[ \"$WORKCELL_TEST_PASS\" = passed ]",
+       ["set -eu", "[ \"$WORKCELL_ACTIVE\" = 1 ]",
+        "[ -z \"${WORKCELL_TEST_SECRET+x}\" ]", "[ \"$WORKCELL_TEST_PASS\" = passed ]",
         "[ \"$WORKCELL_TEST_VALUE\" = last=part ]", "[ \"${WORKCELL_TEST_EMPTY+x}\" = x ]",
         "[ -z \"$WORKCELL_TEST_EMPTY\" ]"]]
     pure ()

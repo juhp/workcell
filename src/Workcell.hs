@@ -73,7 +73,8 @@ prepare opts = do
   term <- fromMaybe "dumb" <$> lookupEnv "TERM"
   let homeArgs = maybe ["--tmpfs", home]
         (\path -> ["--bind", path, home]) suppliedHome
-      defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term)] ++ locale
+      defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term),
+                  ("WORKCELL_ACTIVE", "1")] ++ locale
       cmd = if null (command opts)
         then ["/bin/bash"] else command opts
       args = ["--die-with-parent"] ++ filesystem
