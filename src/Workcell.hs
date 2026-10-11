@@ -5,7 +5,7 @@ import Control.Monad (forM, unless, when)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (isPrefixOf, nub)
 import Data.Maybe (fromMaybe)
-import SimpleCmd (needProgram)
+import SimpleCmd (cmdFull, needProgram)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory)
@@ -19,6 +19,7 @@ data Options = Options
   , volumeOptions :: [String]
   , environmentOptions :: [String]
   , dryRun :: Bool
+  , shareProcesses :: Bool
   , command :: [String]
   }
 
@@ -40,6 +41,7 @@ runWorkcell opts = do
     then putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments launch
     else do
       needProgram "bwrap"
+      unless (shareProcesses opts) verifyProcessIsolation
       mapM_ (createDirectoryIfMissing True) (persistentHome launch)
       executeFile "bwrap" True (arguments launch) Nothing
 
@@ -54,6 +56,11 @@ prepare opts = do
   rejectRoot "HOME" home
   suppliedHome <- traverse resolveHome (homeOption opts)
   mounts <- mapM resolveMount (volumeOptions opts)
+  unless (shareProcesses opts) $ do
+    when (within "/proc" project || within home "/proc" || within "/proc" home) $
+      invalid "home and project must not overlap private /proc"
+    mapM_ (\mount -> when (within (destination mount) "/proc" || within "/proc" (destination mount)) $
+      invalid "volume destination must not overlap private /proc") mounts
   systemFiles <- preservedSystemFiles
   let destinations = map destination mounts
   unless (length destinations == length (nub destinations)) $
@@ -68,7 +75,9 @@ prepare opts = do
         then ["/bin/bash"] else command opts
       args = ["--die-with-parent", "--ro-bind", "/", "/"]
         ++ concatMap (\path -> ["--tmpfs", path]) temporaryRoots
-        ++ ["--dev", "/dev", "--ro-bind", "/proc", "/proc", "--dir", home]
+        ++ ["--dev", "/dev"]
+        ++ (if shareProcesses opts then ["--ro-bind", "/proc", "/proc"] else privateProcArgs)
+        ++ ["--dir", home]
         ++ homeArgs
         ++ concatMap mountArgs systemFiles
         ++ concatMap mountArgs mounts
@@ -76,6 +85,20 @@ prepare opts = do
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ env)
         ++ ["--"] ++ cmd
   pure $ Launch args suppliedHome
+
+privateProcArgs :: [String]
+privateProcArgs = ["--unshare-pid", "--proc", "/proc"]
+
+-- Check before creating a persistent home or running the requested command.
+-- Keep exec for the real launch so terminal handling and exit status are unchanged.
+verifyProcessIsolation :: IO ()
+verifyProcessIsolation = do
+  (ok, _, err) <- cmdFull "bwrap"
+    (["--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev"]
+     ++ privateProcArgs ++ ["--", "/bin/true"]) ""
+  unless ok $ invalid $
+    "private PID namespace and /proc are unavailable in this environment. "
+    ++ "Use --share-processes only if sharing enclosing processes is acceptable.\n" ++ err
 
 systemPath :: String
 systemPath = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
