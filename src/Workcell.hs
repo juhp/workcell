@@ -10,7 +10,7 @@ import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
 import System.Environment (getEnvironment, lookupEnv)
-import System.FilePath (isAbsolute, normalise, splitDirectories)
+import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.Posix.Process (executeFile)
 
 data Options = Options
@@ -138,16 +138,39 @@ filesystemArgs False = do
     ++ aliases ++ concatMap (\path -> ["--dir", path]) ["/var", "/opt", "/srv", "/sys"]
     ++ ["--perms", "1777", "--tmpfs", "/var/tmp"] ++ varHomeAlias
 
--- Toolbx links these files into /run/host. Preserve only the files, not /run/host.
+-- Toolbx links these files into /run/host.  Mount only the files instead.
 preservedSystemFiles :: Bool -> IO [Mount]
 preservedSystemFiles shared = fmap concat $ forM
   ["/etc/resolv.conf", "/etc/hosts", "/etc/host.conf", "/etc/localtime"] $ \path -> do
   exists <- doesPathExist path
   if not exists then pure [] else do
     resolved <- canonicalizePath path
-    let hidden = if shared then any (`within` resolved) temporaryRoots
-                 else not $ any (`within` resolved) systemDirectories
-    pure [Mount resolved resolved False | hidden]
+    let hidden target = if shared then any (`within` target) temporaryRoots
+                        else not $ any (`within` target) systemDirectories
+    target <- hiddenSystemTarget hidden path
+    pure $ maybe [] (\dest -> [Mount resolved dest False]) target
+
+-- Stop at the first hidden part of a symlink chain. Its final target may be
+-- exposed under /usr, while an intermediate link under /run is still hidden.
+-- Inspect parent components too, and resolve relative links against their parent.
+hiddenSystemTarget :: (FilePath -> Bool) -> FilePath -> IO (Maybe FilePath)
+hiddenSystemTarget hidden = restart
+  where
+    restart path = walk "/" (drop 1 $ splitDirectories path)
+    walk _ [] = pure Nothing
+    walk parent (".":rest) = walk parent rest
+    walk parent ("..":rest) = walk (takeDirectory parent) rest
+    walk parent (part:rest) = do
+      let path = parent </> part
+      if hidden path
+        then pure $ Just $ foldl (</>) path rest
+        else do
+          symlink <- pathIsSymbolicLink path
+          if symlink then do
+            target <- getSymbolicLinkTarget path
+            let absolute = if isAbsolute target then target else parent </> target
+            restart $ foldl (</>) absolute rest
+          else walk path rest
 
 existingDirectory :: String -> FilePath -> IO FilePath
 existingDirectory label path = do
