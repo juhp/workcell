@@ -1,0 +1,61 @@
+cabal-version:       2.2
+name:                workcell
+version:             0.1.0
+synopsis:            Project isolation using bubblewrap
+description:
+        Run installed system tools with a read-only filesystem,
+        isolated home, and explicit writable project access.
+license:             LGPL-2.1-or-later
+license-file:        COPYING.md
+author:              Jens Petersen <juhpetersen@gmail.com>
+maintainer:          Jens Petersen <juhpetersen@gmail.com>
+copyright:           2026  Jens Petersen <juhpetersen@gmail.com>
+category:            Unclassified
+homepage:            https://github.com/juhp/workcell
+bug-reports:         https://github.com/juhp/workcell/issues
+build-type:          Simple
+extra-doc-files:     README.md
+                     ChangeLog.md
+extra-source-files:  bwrap.sh
+                     test/integration.py
+--                       ChangeLog.md
+-- tested-with:         GHC == 8.10.7
+--                       || == 9.0.2
+--                       || == 9.2.8
+--                       || == 9.4.8
+--                       || == 9.6.7
+--                       || == 9.8.4
+--                       || == 9.10.3
+--                       || == 9.12.4
+
+source-repository head
+  type:                git
+  location:            https://github.com/juhp/workcell.git
+
+executable workcell
+  main-is:             Main.hs
+  other-modules:       Workcell
+                       Paths_workcell
+  autogen-modules:     Paths_workcell
+  hs-source-dirs:      src
+  build-depends:       base < 5,
+                       directory,
+                       filepath,
+                       simple-cmd,
+                       simple-cmd-args,
+                       unix
+  default-language:    Haskell2010
+  ghc-options:         -Wall
+  if impl(ghc >= 8.0)
+    ghc-options:       -Wcompat
+                       -Widentities
+                       -Wincomplete-uni-patterns
+                       -Wincomplete-record-updates
+                       -Wredundant-constraints
+  if impl(ghc >= 8.2)
+    ghc-options:       -fhide-source-paths
+  if impl(ghc >= 8.4)
+    ghc-options:       -Wmissing-export-lists
+                       -Wpartial-fields
+  if impl(ghc >= 8.10)
+    ghc-options:       -Wunused-packages
