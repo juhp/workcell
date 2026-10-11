@@ -8,7 +8,7 @@ import Data.Maybe (fromMaybe)
 import SimpleCmd (cmdFull, needProgram)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
-   doesPathExist, getHomeDirectory)
+   doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
 import System.Environment (lookupEnv)
 import System.FilePath (isAbsolute, normalise, splitDirectories)
 import System.Posix.Process (executeFile)
@@ -20,6 +20,7 @@ data Options = Options
   , environmentOptions :: [String]
   , dryRun :: Bool
   , shareProcesses :: Bool
+  , shareFilesystem :: Bool
   , command :: [String]
   }
 
@@ -61,11 +62,12 @@ prepare opts = do
       invalid "home and project must not overlap private /proc"
     mapM_ (\mount -> when (within (destination mount) "/proc" || within "/proc" (destination mount)) $
       invalid "volume destination must not overlap private /proc") mounts
-  systemFiles <- preservedSystemFiles
+  filesystem <- filesystemArgs (shareFilesystem opts)
+  systemFiles <- preservedSystemFiles (shareFilesystem opts)
   let destinations = map destination mounts
   unless (length destinations == length (nub destinations)) $
     invalid "duplicate volume destinations"
-  mapM_ (validateMount project home) mounts
+  mapM_ (validateMount (shareFilesystem opts) project home) mounts
   env <- mapM resolveEnvironment (environmentOptions opts)
   term <- fromMaybe "dumb" <$> lookupEnv "TERM"
   let homeArgs = maybe ["--tmpfs", home]
@@ -73,7 +75,7 @@ prepare opts = do
       defaults = [("HOME", home), ("PATH", systemPath), ("TERM", term)]
       cmd = if null (command opts)
         then ["/bin/bash"] else command opts
-      args = ["--die-with-parent", "--ro-bind", "/", "/"]
+      args = ["--die-with-parent"] ++ filesystem
         ++ concatMap (\path -> ["--tmpfs", path]) temporaryRoots
         ++ ["--dev", "/dev"]
         ++ (if shareProcesses opts then ["--ro-bind", "/proc", "/proc"] else privateProcArgs)
@@ -83,6 +85,7 @@ prepare opts = do
         ++ concatMap mountArgs mounts
         ++ ["--bind", project, project, "--chdir", project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ env)
+        ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
         ++ ["--"] ++ cmd
   pure $ Launch args suppliedHome
 
@@ -106,13 +109,41 @@ systemPath = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 temporaryRoots :: [FilePath]
 temporaryRoots = ["/home", "/root", "/tmp", "/run"]
 
+systemDirectories :: [FilePath]
+systemDirectories = ["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64"]
+
+filesystemArgs :: Bool -> IO [String]
+filesystemArgs True = pure ["--ro-bind", "/", "/"]
+filesystemArgs False = do
+  aliases <- fmap concat $ forM (drop 2 systemDirectories) $ \path -> do
+    exists <- doesDirectoryExist path
+    if not exists then pure [] else do
+      symlink <- pathIsSymbolicLink path
+      if symlink
+        then do
+          target <- getSymbolicLinkTarget path
+          pure ["--symlink", target, path]
+        else pure ["--ro-bind", path, path]
+  varHomeExists <- doesPathExist "/var/home"
+  varHomeAlias <- if not varHomeExists then pure [] else do
+    symlink <- pathIsSymbolicLink "/var/home"
+    resolved <- canonicalizePath "/var/home"
+    pure $ if symlink && resolved == "/home"
+      then ["--symlink", "../home", "/var/home"] else []
+  pure $ ["--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
+    ++ aliases ++ concatMap (\path -> ["--dir", path]) ["/var", "/opt", "/srv", "/sys"]
+    ++ ["--perms", "1777", "--tmpfs", "/var/tmp"] ++ varHomeAlias
+
 -- Toolbx links these files into /run/host. Preserve only the files, not /run/host.
-preservedSystemFiles :: IO [Mount]
-preservedSystemFiles = fmap concat $ forM ["/etc/resolv.conf", "/etc/hosts"] $ \path -> do
+preservedSystemFiles :: Bool -> IO [Mount]
+preservedSystemFiles shared = fmap concat $ forM
+  ["/etc/resolv.conf", "/etc/hosts", "/etc/host.conf", "/etc/localtime"] $ \path -> do
   exists <- doesPathExist path
   if not exists then pure [] else do
     resolved <- canonicalizePath path
-    pure [Mount resolved resolved False | any (`within` resolved) temporaryRoots]
+    let hidden = if shared then any (`within` resolved) temporaryRoots
+                 else not $ any (`within` resolved) systemDirectories
+    pure [Mount resolved resolved False | hidden]
 
 existingDirectory :: String -> FilePath -> IO FilePath
 existingDirectory label path = do
@@ -164,15 +195,16 @@ within :: FilePath -> FilePath -> Bool
 within parent child = splitDirectories (normalise parent)
   `isPrefixOf` splitDirectories (normalise child)
 
-validateMount :: FilePath -> FilePath -> Mount -> IO ()
-validateMount project home mount = do
+validateMount :: Bool -> FilePath -> FilePath -> Mount -> IO ()
+validateMount shared project home mount = do
   let dest = destination mount
   when (within dest home || within dest project || within project dest) $
     invalid $ "volume destination overlaps home or project: " ++ dest
   let temporary = any (`within` dest) (home : temporaryRoots)
   exists <- doesPathExist dest
-  unless (temporary || exists) $
-    invalid $ "volume destination must already exist outside temporary directories: " ++ dest
+  when (not exists && not temporary &&
+        (shared || any (`within` dest) systemDirectories)) $
+    invalid $ "volume destination cannot be created beneath a read-only system mount: " ++ dest
   srcDir <- doesDirectoryExist (source mount)
   dstDir <- doesDirectoryExist dest
   when (exists && srcDir /= dstDir) $

@@ -25,4 +25,5 @@ options = Options
   <*> many (strOptionWith 'e' "env" "KEY[=VALUE]" "Set or pass through an environment variable")
   <*> switchLongWith "dryrun" "Print the bubblewrap command without changing files"
   <*> switchLongWith "share-processes" "Share enclosing processes and /proc instead of isolating them"
+  <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"
   <*> many (strArg "COMMAND ARG...")
