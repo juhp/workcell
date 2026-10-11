@@ -19,7 +19,7 @@ main = simpleCmdArgs' (Just version) "workcell"
 
 options :: Parser Options
 options = Options
-  <$> strOptionalWith 'p' "project" "DIR" "Writable project (default: current directory)" "."
+  <$> optional (strOptionWith 'p' "project" "DIR" "Writable project (default: current directory, excluding HOME and ancestors)")
   <*> optional (strOptionWith 'H' "home" "DIR" "Persistent writable home (created if missing)")
   <*> many (strOptionWith 'v' "volume" "SOURCE[:DEST][:ro|rw]" "Extra mount (default: same path, read-only)")
   <*> many (strOptionWith 'e' "env" "KEY[=VALUE]" "Set or pass through an environment variable")

@@ -29,6 +29,10 @@ workcell -v /path/to/data:/opt/data:ro -- ls /opt/data
 `-p/--project` defaults to the current directory. The project is mounted writable
 at its original absolute path (resolved through symlinks); commands start there.
 Edits and deletions affect the original project immediately.
+When the current directory is your home or one of its ancestors, the implicit
+project is omitted and commands start in the isolated home instead. Explicit
+`--project` paths covering your home are rejected, since mounting them would
+expose the original home over the isolated home.
 
 Home is mounted at the invoking user's original home path (resolved through
 symlinks). It is empty and temporary by default. `-H/--home DIR` uses a persistent

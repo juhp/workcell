@@ -14,7 +14,7 @@ import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDire
 import System.Posix.Process (executeFile)
 
 data Options = Options
-  { projectOption :: FilePath
+  { projectOption :: Maybe FilePath
   , homeOption :: Maybe FilePath
   , volumeOptions :: [String]
   , environmentOptions :: [String]
@@ -49,16 +49,18 @@ runWorkcell opts = do
 -- Validate paths and construct argv before creating any persistent home.
 prepare :: Options -> IO Launch
 prepare opts = do
-  project <- existingDirectory "project" (projectOption opts)
-  rejectRoot "project" project
+  candidate <- existingDirectory "project" (fromMaybe "." $ projectOption opts)
   originalHome <- getHomeDirectory
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
   home <- existingDirectory "HOME" originalHome
   rejectRoot "HOME" home
+  when (projectOption opts /= Nothing && within candidate home) $
+    invalid "project must not cover HOME; select a project directory with --project"
+  let project = if within candidate home then Nothing else Just candidate
   suppliedHome <- traverse resolveHome (homeOption opts)
   mounts <- mapM resolveMount (volumeOptions opts)
   unless (shareProcesses opts) $ do
-    when (within "/proc" project || within home "/proc" || within "/proc" home) $
+    when (maybe False (within "/proc") project || within home "/proc" || within "/proc" home) $
       invalid "home and project must not overlap private /proc"
     mapM_ (\mount -> when (within (destination mount) "/proc" || within "/proc" (destination mount)) $
       invalid "volume destination must not overlap private /proc") mounts
@@ -85,7 +87,8 @@ prepare opts = do
         ++ homeArgs
         ++ concatMap mountArgs systemFiles
         ++ concatMap mountArgs mounts
-        ++ ["--bind", project, project, "--chdir", project, "--clearenv"]
+        ++ maybe [] (\path -> ["--bind", path, path]) project
+        ++ ["--chdir", fromMaybe home project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
         ++ ["--"] ++ cmd
@@ -225,10 +228,10 @@ within :: FilePath -> FilePath -> Bool
 within parent child = splitDirectories (normalise parent)
   `isPrefixOf` splitDirectories (normalise child)
 
-validateMount :: Bool -> FilePath -> FilePath -> Mount -> IO ()
+validateMount :: Bool -> Maybe FilePath -> FilePath -> Mount -> IO ()
 validateMount shared project home mount = do
   let dest = destination mount
-  when (within dest home || within dest project || within project dest) $
+  when (within dest home || maybe False (\path -> within dest path || within path dest) project) $
     invalid $ "volume destination overlaps home or project: " ++ dest
   let temporary = any (`within` dest) (home : temporaryRoots)
   exists <- doesPathExist dest

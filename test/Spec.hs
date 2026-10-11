@@ -8,7 +8,7 @@ import Data.List (isPrefixOf)
 import System.Directory hiding (executable)
 import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode(..), die)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.Posix.Files (readSymbolicLink)
 import System.Posix.Temp (mkdtemp)
 import System.Process hiding (shell)
@@ -221,6 +221,28 @@ spec = describe "workcell CLI" $ do
     let supplied = root ctx </> "must not be created"
     _ <- failure ctx ["-H", supplied, "-v", root ctx </> "missing", "--", "/bin/true"]
     doesPathExist supplied `shouldReturn` False
+
+  it "rejects projects that cover the isolated home" $ \ctx -> do
+    let supplied = root ctx </> "must not be created"
+    forM_ [[], ["-H", supplied]] $ \homeArgs -> do
+      err <- failure ctx $ ["-p", home ctx] ++ homeArgs ++ ["--dryrun"]
+      err `shouldContain` "project must not cover HOME"
+    doesPathExist supplied `shouldReturn` False
+
+  it "omits implicit projects at home and its ancestors" $ \ctx -> do
+    let supplied = root ctx </> "isolated home"
+        flags = ["--share-processes" | not (privateProc ctx)]
+    createDirectory supplied
+    writeFile (supplied </> "marker") "isolated"
+    forM_ [home ctx, takeDirectory (home ctx), "/"] $ \directory -> do
+      forM_ [[], ["-H", supplied]] $ \homeArgs -> do
+        let script = "[ \"$PWD\" = \"$HOME\" ] && [ ! -e \"$1\" ]" ++
+              if null homeArgs then " && [ -z \"$(ls -A \"$HOME\")\" ]"
+              else " && [ \"$(cat marker)\" = isolated ]"
+            args = flags ++ homeArgs ++
+              ["--", "/bin/sh", "-ec", script, "check", root ctx]
+        _ <- successful =<< capture ((proc (binary ctx) args) {cwd = Just directory})
+        pure ()
 
   it "runs the installed GHC" $ \ctx -> do
     available <- findExecutable "ghc"
