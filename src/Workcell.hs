@@ -106,11 +106,15 @@ prepare opts = do
     mapM_ (\mount -> when (within (destination mount) "/proc" || within "/proc" (destination mount)) $
       invalid "volume destination must not overlap private /proc") mounts
   filesystem <- filesystemArgs (shareFilesystem opts)
-  inheritedSystemFiles <- preservedSystemFiles (shareFilesystem opts) (mode /= PrivateNetwork)
+  resolverArgs <- if mode == PrivateNetwork then pure []
+                  else liveResolverArgs (shareFilesystem opts) mounts
+  inheritedSystemFiles <- preservedSystemFiles (shareFilesystem opts)
+    (mode /= PrivateNetwork && null resolverArgs)
   let systemFiles =
         filter
         (\system -> not $
-          any (\mount -> within (destination mount) (destination system)) mounts)
+          any (\mount -> within (destination mount) (destination system) ||
+                         within (destination mount) (source system)) mounts)
         inheritedSystemFiles
   systemMounts <-
     forM (zip [0 :: Int ..] systemFiles) $ \(index, mount) -> do
@@ -146,6 +150,7 @@ prepare opts = do
         ++ (if shareProcesses opts then ["--ro-bind", "/proc", "/proc"] else privateProcArgs)
         ++ ["--dir", home]
         ++ homeArgs
+        ++ resolverArgs
       args = beforeSystemFiles ++ concatMap fst systemMounts
         ++ ["--unshare-net" | mode /= HostNetwork]
         ++ concatMap mountArgs mounts
@@ -208,7 +213,29 @@ filesystemArgs False = do
     ++ aliases ++ concatMap (\path -> ["--dir", path]) ["/var", "/opt", "/srv", "/sys"]
     ++ ["--perms", "1777", "--tmpfs", "/var/tmp"] ++ varHomeAlias
 
--- Toolbx links these files into /run/host.  Mount only the files instead.
+-- Expose only the resolver directory, following atomic file replacements.
+-- Toolbx may route /etc/resolv.conf through /run/host/etc first; recreate
+-- that hidden link without exposing the rest of the host's /etc directory.
+liveResolverArgs :: Bool -> [Mount] -> IO [String]
+liveResolverArgs shared mounts = do
+  exists <- doesPathExist "/etc/resolv.conf"
+  if not exists then pure [] else do
+    resolved <- canonicalizePath "/etc/resolv.conf"
+    let directory = takeDirectory resolved
+        hidden path = if shared then any (`within` path) temporaryRoots
+                      else not $ any (`within` path) systemDirectories
+        covered path = any (\mount -> within (destination mount) path) mounts
+    target <- hiddenSystemTarget hidden "/etc/resolv.conf"
+    status <- getFileStatus resolved
+    pure $ case target of
+      Just dest | directory `elem` ["/run/systemd/resolve", "/run/host/run/systemd/resolve"]
+                  && linkCount status /= 0
+                  && not (covered dest) ->
+        (if covered resolved then [] else ["--ro-bind", directory, directory]) ++
+        [arg | dest /= resolved, arg <- ["--symlink", resolved, dest]]
+      _ -> []
+
+-- Toolbx links other configuration into /run/host. Mount only those files.
 preservedSystemFiles :: Bool -> Bool -> IO [Mount]
 preservedSystemFiles shared preserveResolver = fmap concat $ forM
   (["/etc/resolv.conf" | preserveResolver] ++

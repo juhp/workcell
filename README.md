@@ -112,6 +112,10 @@ development, prevent mounting a fresh `/proc`. `--share-processes` explicitly
 uses the enclosing PID namespace and existing read-only `/proc` instead. This
 exposes enclosing process information and potentially filesystem handles.
 Process sharing does not change the selected network mode.
+In host and offline network modes, a resolver under `/run/systemd/resolve`
+(including Toolbx's `/run/host/run/systemd/resolve` layout) is preserved by
+binding that directory read-only. This follows resolver file replacements while
+keeping other `/run` contents hidden. Explicit resolver volumes take precedence.
 Individual targets of `/etc/resolv.conf`, `/etc/hosts`, `/etc/host.conf`, and
 `/etc/localtime` are preserved read-only when they live outside the exposed
 system directories, as they commonly do in Toolbx. Their enclosing directories
@@ -119,6 +123,9 @@ remain hidden.
 Configuration files backed by unlinked inodes, including a parent workcell's
 generated resolver, are copied into read-only mounts so nested workcells can
 preserve them too.
+Individual file mounts follow in-place edits but not file replacements; copies
+are snapshots. Private networking's generated resolver remains a launch-time
+snapshot of search/domain and options settings.
 
 Networking defaults to `--network private`. Each workcell gets its own network
 namespace with outbound connectivity provided by a separate pasta process.

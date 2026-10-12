@@ -470,6 +470,43 @@ spec = describe "workcell CLI" $ do
                                       {cwd = Just (project ctx), close_fds = False})
         BS.readFile (project ctx </> "localtime-copy") `shouldReturn` (if override then replaced else expected)
 
+  it "tracks resolver replacements through systemd and toolbox directory mounts" $ \ctx -> do
+    let sparseEtc = root ctx </> "sparse etc"
+        resolverDir = project ctx </> "resolver"
+        overrideFile = project ctx </> "override"
+        flags = ["--share-processes" | not (privateProc ctx)]
+    createDirectory sparseEtc
+    createDirectory resolverDir
+    writeFile overrideFile "override\n"
+    forM_ [False, True] $ \toolbox -> do
+      let directory = if toolbox then "/run/host/run/systemd/resolve" else "/run/systemd/resolve"
+          target = directory </> "stub-resolv.conf"
+          link = if toolbox then "/run/host/etc/resolv.conf" else target
+          outer = ["--ro-bind", "/", "/", "--proc", "/proc",
+                   "--bind", project ctx, project ctx, "--ro-bind", sparseEtc, "/etc",
+                   "--tmpfs", "/run", "--ro-bind", resolverDir, directory] ++
+                  (if toolbox then ["--symlink", target, link] else []) ++ ["--", binary ctx]
+          run args = successful =<< capture ((proc "bwrap" (outer ++ flags ++ args))
+                                              {cwd = Just (project ctx)})
+      createFileLink link (sparseEtc </> "resolv.conf")
+      forM_ [False, True] $ \shared ->
+        forM_ ("host" : ["none" | privateNet ctx]) $ \mode -> do
+          writeFile (resolverDir </> "stub-resolv.conf") "initial\n"
+          writeFile (resolverDir </> "replacement") "updated\n"
+          out <- run $ ["--network", mode] ++ ["--share-filesystem" | shared] ++
+            ["--", "/bin/sh", "-ec", unlines
+              ["cat /etc/resolv.conf",
+               "mv resolver/replacement resolver/stub-resolv.conf",
+               "cat /etc/resolv.conf",
+               "! (printf changed > /etc/resolv.conf)",
+               "[ ! -e /run/host/etc/unrelated ]"]]
+          out `shouldBe` "initial\nupdated\n"
+      run ["--share-network", "-v", overrideFile ++ ":/etc/resolv.conf:ro",
+           "--", "cat", "/etc/resolv.conf"] `shouldReturn` "override\n"
+      dry <- run ["--network", "private", "--dryrun"]
+      dry `shouldNotContain` ("'--ro-bind' '" ++ directory ++ "' '" ++ directory ++ "'")
+      removeFile (sparseEtc </> "resolv.conf")
+
   it "starts when optional configuration files are absent or localtime is a dangling symlink" $ \ctx -> do
     let sparseEtc = root ctx </> "sparse etc"
         flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
