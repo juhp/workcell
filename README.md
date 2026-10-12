@@ -155,6 +155,16 @@ then releases the command. Workcell supervises both processes, returns the
 command's exit status, and stops the sandbox if the helper exits unexpectedly.
 Both processes are cleaned up when the command exits or workcell is terminated.
 
+Pasta diagnostics go to a separate owner-readable log for each run under
+`$XDG_STATE_HOME/workcell/logs`, or `~/.local/state/workcell/logs` when that
+variable is unset or not absolute. This location uses the enclosing environment,
+before workcell isolates the home directory. Startup failures and unexpected
+helper exits report the log path and up to 20 recent lines (at most 8 KiB) in
+the terminal. Command output and bubblewrap errors still go to the terminal.
+Successful network-preflight logs are removed; failed preflight and actual-run
+logs are retained, with no automatic pruning. Logging does not fix network
+errors; it keeps helper diagnostics from interrupting interactive programs.
+
 Private mode needs pasta on `PATH`, an accessible `/dev/net/tun`, a configured
 nameserver in `/etc/resolv.conf`, and permission to create the required
 namespaces. Workcell checks network setup before creating a persistent home or

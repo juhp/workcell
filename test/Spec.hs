@@ -1,8 +1,8 @@
 -- SPDX-License-Identifier: LGPL-2.1-or-later
 module Main (main) where
 
-import Control.Exception (bracket)
-import Control.Concurrent (threadDelay)
+import Control.Exception (bracket, throwIO)
+import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
 import Data.List (isPrefixOf)
@@ -12,7 +12,8 @@ import System.Directory hiding (executable)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..), die, exitWith)
 import System.FilePath ((</>), takeDirectory)
-import System.Posix.Files (readSymbolicLink, setFileMode)
+import System.Posix.Files (fileMode, getFileStatus, readSymbolicLink, setFileMode)
+import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
@@ -264,15 +265,109 @@ spec = describe "workcell CLI" $ do
     let tools = root ctx </> "failing helper"
         helper = tools </> "pasta"
     createDirectory tools
-    writeFile helper "#!/bin/sh\nexit 42\n"
+    writeFile helper $ unlines $ ["#!/bin/sh", "echo earlier-diagnostic >&2"] ++
+      ["echo diagnostic-" ++ show n ++ " >&2" | n <- [1 :: Int .. 25]] ++ ["exit 42"]
     setFileMode helper 0o700
     environment <- getEnvironment
     invocation <- loopbackCommand ctx ["/bin/sh", "-c", "touch command-ran"]
-    let envs = setVariables [("PATH", tools ++ ":/usr/bin:/bin")] environment
+    let envs = setVariables [("PATH", tools ++ ":/usr/bin:/bin"),
+                            ("XDG_STATE_HOME", root ctx </> "state")] environment
     (code, _, err) <- capture (invocation {env = Just envs})
     code `shouldNotBe` ExitSuccess
     err `shouldContain` "pasta exited during network setup"
+    err `shouldContain` "diagnostic-25"
+    err `shouldNotContain` "earlier-diagnostic"
+    logs <- pastaLogs ctx
+    length logs `shouldBe` 1
+    forM_ logs $ \path -> do
+      err `shouldContain` path
+      readFile path >>= (`shouldContain` "earlier-diagnostic")
+      status <- getFileStatus path
+      (fileMode status .&. 0o777) `shouldBe` 0o600
     doesPathExist (project ctx </> "command-ran") `shouldReturn` False
+
+  it "logs helper warnings quietly and keeps distinct logs for concurrent runs" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    let helper = unlines
+          ["echo helper-warning >&2", "while [ \"$1\" != --pid ]; do shift; done",
+           "echo $$ > \"$2\"", "exec /bin/sleep 30"]
+    invocation <- fakeHelperCommand ctx helper ["/bin/sh", "-c", "printf command-output; exit 23"]
+    first <- newEmptyMVar
+    second <- newEmptyMVar
+    _ <- forkFinally (capture invocation) (putMVar first)
+    _ <- forkFinally (capture invocation) (putMVar second)
+    forM_ [first, second] $ \result -> do
+      (code, out, err) <- takeMVar result >>= either throwIO pure
+      code `shouldBe` ExitFailure 23
+      out `shouldBe` "command-output"
+      err `shouldBe` ""
+    logs <- pastaLogs ctx
+    length logs `shouldBe` 2
+    forM_ logs $ \path -> readFile path `shouldReturn` "helper-warning\n"
+
+  it "reports retained diagnostics when the helper exits during a command" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    let helper = unlines
+          ["while [ \"$1\" != --pid ]; do shift; done", "echo $$ > \"$2\"",
+           "while [ ! -f command-ran ]; do /bin/sleep 0.01; done",
+           "echo runtime-failure >&2", "exit 42"]
+    invocation <- fakeHelperCommand ctx helper
+      ["/bin/sh", "-c", "touch command-ran; exec /bin/sleep 30"]
+    (code, _, err) <- capture invocation
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "pasta exited while the command was running"
+    err `shouldContain` "runtime-failure"
+    logs <- pastaLogs ctx
+    length logs `shouldBe` 1
+    forM_ logs $ \path -> err `shouldContain` path
+
+  it "uses enclosing HOME for logs when XDG_STATE_HOME is relative" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    invocation <- fakeHelperCommand ctx "echo fallback-diagnostic >&2\nexit 42" ["/bin/true"]
+    environment <- getEnvironment
+    let envs = setVariables [("HOME", root ctx), ("XDG_STATE_HOME", "relative-state")]
+          (maybe environment id $ env invocation)
+    (_, _, err) <- capture (invocation {env = Just envs})
+    let directory = root ctx </> ".local/state/workcell/logs"
+    err `shouldContain` directory
+    entries <- listDirectory directory
+    length entries `shouldBe` 1
+
+  it "fails clearly before starting a command when the log cannot be opened" $ \ctx -> do
+    let blocked = root ctx </> "blocked state"
+    writeFile blocked "not a directory"
+    invocation <- loopbackCommand ctx ["/bin/sh", "-c", "touch command-ran"]
+    environment <- getEnvironment
+    let envs = setVariables [("XDG_STATE_HOME", blocked)] environment
+    (code, _, err) <- capture (invocation {env = Just envs})
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "cannot open pasta log"
+    doesPathExist (project ctx </> "command-ran") `shouldReturn` False
+
+  it "creates no helper logs for dry runs, host networking, or offline networking" $ \ctx -> do
+    environment <- getEnvironment
+    let envs = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
+    _ <- successful =<< invoke ctx Nothing (Just envs) ["--dryrun"]
+    _ <- successful =<< invoke ctx Nothing (Just envs) ["--share-network", "--", "/bin/true"]
+    when (privateNet ctx) $ do
+      _ <- successful =<< invoke ctx Nothing (Just envs) ["--network", "none", "--", "/bin/true"]
+      pure ()
+    doesPathExist (root ctx </> "state") `shouldReturn` False
+
+  it "discards successful preflight logs but retains failed preflight diagnostics" $ \ctx -> do
+    unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
+    environment <- getEnvironment
+    let stateEnv = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
+    _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network", "private", "--", "/bin/true"]
+    pastaLogs ctx >>= (\logs -> length logs `shouldBe` 1)
+    invocation <- fakeHelperCommand ctx "echo preflight-failure >&2\nexit 42" ["/bin/true"]
+    (code, _, err) <- invoke ctx Nothing (env invocation)
+      ["--network", "private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "preflight-failure"
+    err `shouldContain` "Pasta log:"
+    pastaLogs ctx >>= (\logs -> length logs `shouldBe` 2)
+    doesPathExist (root ctx </> "uncreated home") `shouldReturn` False
 
   it "can explicitly share the enclosing PID namespace" $ \ctx -> do
     expected <- readSymbolicLink "/proc/self/ns/pid"
@@ -621,11 +716,31 @@ requireLoopbackPasta = do
 loopbackCommand :: Context -> [String] -> IO CreateProcess
 loopbackCommand ctx command = do
   executable <- getExecutablePath
+  environment <- getEnvironment
   let args = ["--test-loopback-network", "--die-with-parent", "--ro-bind", "/", "/",
               "--dev", "/dev", "--unshare-net", "--tmpfs", "/tmp", "--tmpfs", "/run",
               "--bind", project ctx, project ctx, "--chdir", project ctx] ++
         (if privateProc ctx then ["--unshare-pid", "--proc", "/proc"] else []) ++ ["--"] ++ command
-  pure $ (proc executable args) {cwd = Just (project ctx)}
+  pure $ (proc executable args) {cwd = Just (project ctx),
+    env = Just $ setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment}
+
+pastaLogs :: Context -> IO [FilePath]
+pastaLogs ctx = do
+  let directory = root ctx </> "state/workcell/logs"
+  entries <- listDirectory directory
+  pure $ map (directory </>) entries
+
+fakeHelperCommand :: Context -> String -> [String] -> IO CreateProcess
+fakeHelperCommand ctx script command = do
+  let tools = root ctx </> "helper tools"
+      helper = tools </> "pasta"
+  createDirectory tools
+  writeFile helper $ "#!/bin/sh\n" ++ script
+  setFileMode helper 0o700
+  invocation <- loopbackCommand ctx command
+  environment <- getEnvironment
+  pure invocation {env = Just $ setVariables [("PATH", tools ++ ":/usr/bin:/bin")]
+                    (maybe environment id $ env invocation)}
 
 waitUntil :: IO Bool -> IO ()
 waitUntil condition = do

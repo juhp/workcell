@@ -10,16 +10,19 @@ import Control.Exception (bracket, evaluate)
 import Control.Monad (unless, void, when)
 import Data.Aeson (FromJSON(..), eitherDecodeStrict', withObject, (.:))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import SimpleCmd (cmdFull)
 import System.Directory
-  (doesFileExist, doesPathExist, findExecutable, getTemporaryDirectory,
+  (createDirectoryIfMissing, doesFileExist, doesPathExist, findExecutable, getHomeDirectory, getTemporaryDirectory,
    removeFile, removePathForcibly)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
-import System.FilePath ((</>))
+import System.FilePath ((</>), isAbsolute)
 import System.IO
-  (Handle, SeekMode(..), hClose, hPutStr, hSeek, openTempFile)
+  (Handle, IOMode(..), SeekMode(..), hClose, hFileSize, hPutStr, hSeek,
+   openBinaryTempFile, openTempFile, withBinaryFile)
 import System.IO.Error (catchIOError, isDoesNotExistError, ioeGetErrorString)
 import System.Posix.IO
   (OpenMode(..), closeFd, createPipe, defaultFileFlags, fdToHandle, fdWrite,
@@ -73,7 +76,7 @@ verifyNetwork mode processArgs = do
                "--unshare-net", "--tmpfs", "/tmp", "--tmpfs", "/run"] ++ processArgs ++ ["--", "/bin/true"]
   if mode == PrivateNetwork
     then do
-      result <- catchIOError (runPrivateNetwork [] probe "/tmp/workcell-resolv.conf") $
+      result <- catchIOError (runLoggedNetwork True [] probe "/tmp/workcell-resolv.conf") $
         unavailable . ioeGetErrorString
       unless (result == ExitSuccess) $ unavailable $ show result
     else do
@@ -105,7 +108,51 @@ foreign import capi unsafe "linux/nsfs.h value NS_GET_USERNS"
 -- Retain the owning user namespace even if bubblewrap changes its current one.
 -- Pasta watches the sandbox's network reference and quits if that process dies.
 runPrivateNetwork :: [String] -> [String] -> FilePath -> IO ExitCode
-runPrivateNetwork extraPastaArgs args resolverDestination = do
+runPrivateNetwork = runLoggedNetwork False
+
+-- Successful preflight logs are disposable; real runs and failures retain logs.
+runLoggedNetwork :: Bool -> [String] -> [String] -> FilePath -> IO ExitCode
+runLoggedNetwork discardSuccess extraPastaArgs args resolverDestination =
+  withPastaLog discardSuccess $ \logHandle ->
+    runNetwork logHandle extraPastaArgs args resolverDestination
+
+withPastaLog :: Bool -> (Handle -> IO ExitCode) -> IO ExitCode
+withPastaLog discardSuccess action = bracket acquire (hClose . snd) $ \(path, handle) -> do
+  result <- catchIOError (do
+    code <- action handle
+    when (discardSuccess && code /= ExitSuccess) $
+      invalid $ "network preflight exited: " ++ show code
+    pure code) $ \err -> do
+    -- Children have been stopped by their brackets before reading the log.
+    tailText <- catchIOError (diagnosticTail path) $ const $ pure "(unable to read pasta log)\n"
+    invalid $ ioeGetErrorString err ++ "\nPasta log: " ++ path ++
+      (if null tailText then "" else "\nRecent pasta diagnostics:\n" ++ tailText)
+  when discardSuccess $ removeFile path
+  pure result
+  where
+    acquire = catchIOError openLog $ \err ->
+      invalid $ "cannot open pasta log: " ++ ioeGetErrorString err
+    openLog = do
+      state <- lookupEnv "XDG_STATE_HOME"
+      base <- case state of
+        Just path | isAbsolute path -> pure path
+        _ -> (</> ".local/state") <$> getHomeDirectory
+      let directory = base </> "workcell/logs"
+      createDirectoryIfMissing True directory
+      -- openBinaryTempFile creates the file exclusively with mode 0600.
+      openBinaryTempFile directory "pasta.log"
+
+-- Bound both bytes and lines, even for a noisy helper or a huge single line.
+diagnosticTail :: FilePath -> IO String
+diagnosticTail path = withBinaryFile path ReadMode $ \handle -> do
+  size <- hFileSize handle
+  hSeek handle AbsoluteSeek (max 0 $ size - 8192)
+  bytes <- BS.hGet handle 8192
+  let recent = lines $ BSC.unpack bytes
+  pure $ unlines $ drop (max 0 $ length recent - 20) recent
+
+runNetwork :: Handle -> [String] -> [String] -> FilePath -> IO ExitCode
+runNetwork logHandle extraPastaArgs args resolverDestination = do
   tmp <- getTemporaryDirectory
   bracket (mkdtemp $ tmp </> "workcell-network-") removePathForcibly $ \dir -> do
     let readyPipe = dir </> "ready"
@@ -137,7 +184,8 @@ runPrivateNetwork extraPastaArgs args resolverDestination = do
                   pidfile = dir </> "pasta.pid"
                   helper = (proc "pasta" (extraPastaArgs ++
                     pastaArguments childNet (reference userFd) pidfile))
-                    {std_in = NoStream, std_out = NoStream, close_fds = True}
+                    {std_in = NoStream, std_out = NoStream,
+                     std_err = UseHandle logHandle, close_fds = True}
               withChild helper $ \network -> do
                 deadline "waiting for pasta network setup" $ waitReady pidfile child network
                 void $ fdWrite gate "ready\n"
