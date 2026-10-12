@@ -1,7 +1,8 @@
 # workcell
 
 Run installed system tools with a read-only filesystem, an isolated home,
-and a writable project. Requires Linux and bubblewrap.
+and a writable project. Requires Linux and bubblewrap, plus pasta (from the
+`passt` package) for the default private networking mode.
 
 ```sh
 cabal build --offline
@@ -23,6 +24,8 @@ workcell -e LANG -e MY_VAR=hello -- env
 workcell --dryrun -- ghc --version
 workcell --share-processes -- ghc --version # fallback for restricted containers
 workcell --share-filesystem -- ls /var/log # expose enclosing filesystem read-only
+workcell --network none -- ghc --version   # offline, separate loopback network
+workcell --share-network -- curl localhost:8000 # share enclosing network
 workcell -v /path/to/data:/opt/data:ro -- ls /opt/data
 ```
 
@@ -75,8 +78,11 @@ example, `workcell -v ~/.bashrc`) or use a persistent home with `--home`.
 
 Options precede the command. Use `--` to separate command arguments; those
 arguments are passed directly without shell expansion. Without a command,
-workcell starts `/bin/bash`. `--dryrun` prints a shell-quoted
-bubblewrap invocation without launching it or creating a home directory.
+workcell starts `/bin/bash`. `--dryrun` prints a shell-quoted launch without
+launching it or creating a home directory. When networking or configuration
+copies require descriptor setup, it shows the launch plan with descriptor
+placeholders as comments, followed by a command to run the same workcell
+configuration. Otherwise it prints the direct bubblewrap invocation.
 Dry-run output includes explicitly supplied environment values.
 
 The default filesystem starts empty and exposes `/usr` and `/etc` read-only,
@@ -105,11 +111,55 @@ Some restricted containers, including the encapsule environment used during
 development, prevent mounting a fresh `/proc`. `--share-processes` explicitly
 uses the enclosing PID namespace and existing read-only `/proc` instead. This
 exposes enclosing process information and potentially filesystem handles.
-Network access remains shared in both modes.
+Process sharing does not change the selected network mode.
 Individual targets of `/etc/resolv.conf`, `/etc/hosts`, `/etc/host.conf`, and
 `/etc/localtime` are preserved read-only when they live outside the exposed
 system directories, as they commonly do in Toolbx. Their enclosing directories
 remain hidden.
+Configuration files backed by unlinked inodes, including a parent workcell's
+generated resolver, are copied into read-only mounts so nested workcells can
+preserve them too.
+
+Networking defaults to `--network private`. Each workcell gets its own network
+namespace with outbound connectivity provided by a separate pasta process.
+Automatic TCP and UDP forwarding is disabled in both directions, and the special
+host loopback/gateway mappings are disabled. Workcell does not join or modify
+Podman's networking namespaces or configuration.
+
+Choose a mode explicitly with `--network MODE`:
+
+| Mode | Connectivity |
+| --- | --- |
+| `private` (default) | Outbound networking through pasta; separate localhost. |
+| `none` | Private loopback only; no external connectivity; pasta not required. |
+| `host` | Share the enclosing network, including its localhost services. |
+
+`--share-network` is an alias for `--network host`; it cannot be combined with
+`--network`. Network mode is independent of `--share-processes` and
+`--share-filesystem`.
+
+In private mode, workcell supplies a read-only `/etc/resolv.conf` using pasta's
+DNS forwarder at `169.254.1.1`, retaining the enclosing resolver's search/domain
+and options settings. Pasta forwards DNS to the enclosing nameserver, including
+a resolver listening on the enclosing loopback interface. The invoking UID, GID,
+and hostname are preserved inside workcell. Bubblewrap creates the namespace
+with the command paused; workcell attaches pasta to it, waits for network setup,
+then releases the command. Workcell supervises both processes, returns the
+command's exit status, and stops the sandbox if the helper exits unexpectedly.
+Both processes are cleaned up when the command exits or workcell is terminated.
+
+Private mode needs pasta on `PATH`, an accessible `/dev/net/tun`, a configured
+nameserver in `/etc/resolv.conf`, and permission to create the required
+namespaces. Workcell checks network setup before creating a persistent home or
+running your command. It fails rather than falling back to host networking.
+An enclosing workcell's minimal `/dev` hides `/dev/net/tun`, so nested private
+networking needs that device exposed by the enclosing sandbox; alternatively,
+use `--share-network` to use the enclosing workcell's network.
+
+Private networking separates localhost; it does not block every service reachable
+through host or LAN addresses. File-mounted Unix sockets are governed by filesystem
+visibility, independently of network mode. Port publishing and destination
+filtering are not implemented yet.
 
 For nested bubblewrap in encapsule, a capability can supply Podman security
 options. One candidate to test in a new encapsule container is:
@@ -126,10 +176,9 @@ the mount. See [encapsule capabilities](https://github.com/juhp/encapsule#capabi
 and [Podman security options](https://docs.podman.io/en/stable/markdown/podman-run.1.html#security-opt-option).
 
 This is a filesystem isolation experiment, not a sandbox for untrusted code.
-System configuration under `/etc` remains readable, and network services remain
-reachable through shared networking. Explicit mounts and the compatibility
-options can weaken isolation. Named capabilities,
-network isolation, and syscall filtering are deferred.
+System configuration under `/etc` remains readable, and private networking
+allows outbound connections. Explicit mounts and the compatibility options can
+weaken isolation. Named capabilities and syscall filtering are deferred.
 
 Run the Hspec integration suite with Cabal:
 
@@ -144,6 +193,14 @@ The suite runs the executable built by Cabal; set `WORKCELL` to an absolute path
 to test another binary. Each example uses a separate temporary project and
 cleans it up afterward. Bubblewrap is required; GHC and `/var/home` checks are
 marked pending when unavailable.
+Filesystem and process examples use explicit host networking. Network checks
+exercise host and offline modes, localhost separation, DNS/argv setup, and clear
+private-mode startup failures. The real pasta supervisor is also tested in
+loopback-only mode to verify identity, DNS/argv handling, and cleanup without a
+TUN device. Tests requiring a TUN-backed private network are pending when the enclosing
+environment lacks the helper, TUN device, or working namespace support.
+To check actual internet access and DNS resolution on the host, run
+`workcell -- curl --max-time 15 -I https://example.com`.
 
 The original shell prototype is also available:
 

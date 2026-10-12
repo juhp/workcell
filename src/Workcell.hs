@@ -1,17 +1,23 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 module Workcell (Options(..), runWorkcell) where
 
+import Control.Exception (bracket)
 import Control.Monad (forM, unless, when)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
+import Network (NetworkMode(..), networkMode, pastaArguments, runPrivateNetwork, verifyNetwork)
 import SimpleCmd (cmdFull, needProgram)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
-import System.Environment (getEnvironment, lookupEnv)
+import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
+import System.Exit (exitWith)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
+import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Process (executeFile)
+import System.Posix.Files (getFileStatus, linkCount)
+import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
 
 data Options = Options
   { projectOption :: Maybe FilePath
@@ -21,6 +27,8 @@ data Options = Options
   , dryRun :: Bool
   , shareProcesses :: Bool
   , shareFilesystem :: Bool
+  , networkOption :: Maybe String
+  , shareNetwork :: Bool
   , command :: [String]
   }
 
@@ -33,22 +41,55 @@ data Mount = Mount
 data Launch = Launch
   { arguments :: [String]
   , persistentHome :: Maybe FilePath
+  , selectedNetwork :: NetworkMode
+  , resolverDestination :: FilePath
+  , copiedSystemFiles :: [(Int, FilePath)]
   }
 
 runWorkcell :: Options -> IO ()
 runWorkcell opts = do
   launch <- prepare opts
   if dryRun opts
-    then putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments launch
+    then if selectedNetwork launch == PrivateNetwork || not (null $ copiedSystemFiles launch)
+      then do
+        let networkPlan =
+              if selectedNetwork launch == PrivateNetwork
+              then ["--info-fd", "<info-fd>",
+                    "--ro-bind", "<ready-pipe>", "/run/workcell-network-ready",
+                    "--ro-bind-data", "<dns-fd>", resolverDestination launch]
+              else []
+            preview = "bwrap" : networkPlan ++ arguments launch
+        putStrLn $ "# " ++ unwords (map shellQuote preview)
+        when (selectedNetwork launch == PrivateNetwork) $
+          putStrLn $ "# " ++ unwords (map shellQuote $ "pasta" : pastaArguments "<netns>" "<userns>" "<pid-file>")
+        executable <- getExecutablePath
+        argv <- getArgs
+        let (options, cmd) = break (== "--") argv
+        putStrLn $ unwords $ map shellQuote $ executable : filter (/= "--dryrun") options ++ cmd
+      else putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments launch
     else do
       needProgram "bwrap"
       unless (shareProcesses opts) verifyProcessIsolation
-      mapM_ (createDirectoryIfMissing True) (persistentHome launch)
-      executeFile "bwrap" True (arguments launch) Nothing
+      verifyNetwork (selectedNetwork launch)
+        (if shareProcesses opts then [] else privateProcArgs)
+      withSystemFiles (copiedSystemFiles launch) $ \descriptors -> do
+        let liveArgs = [fromMaybe arg (lookup index descriptors) |
+                        (index, arg) <- zip [0..] (arguments launch)]
+        mapM_ (createDirectoryIfMissing True) (persistentHome launch)
+        if selectedNetwork launch == PrivateNetwork
+          then runPrivateNetwork [] liveArgs (resolverDestination launch) >>= exitWith
+          else executeFile "bwrap" True liveArgs Nothing
+
+withSystemFiles :: [(Int, FilePath)] -> ([(Int, String)] -> IO a) -> IO a
+withSystemFiles [] action = action []
+withSystemFiles ((index, path):rest) action =
+  bracket (openFd path ReadOnly defaultFileFlags) closeFd $ \fd ->
+    withSystemFiles rest $ \descriptors -> action ((index, show fd) : descriptors)
 
 -- Validate paths and construct argv before creating any persistent home.
 prepare :: Options -> IO Launch
 prepare opts = do
+  mode <- networkMode (networkOption opts) (shareNetwork opts)
   candidate <- existingDirectory "project" (fromMaybe "." $ projectOption opts)
   originalHome <- getHomeDirectory
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
@@ -65,7 +106,27 @@ prepare opts = do
     mapM_ (\mount -> when (within (destination mount) "/proc" || within "/proc" (destination mount)) $
       invalid "volume destination must not overlap private /proc") mounts
   filesystem <- filesystemArgs (shareFilesystem opts)
-  systemFiles <- preservedSystemFiles (shareFilesystem opts)
+  inheritedSystemFiles <- preservedSystemFiles (shareFilesystem opts) (mode /= PrivateNetwork)
+  let systemFiles =
+        filter
+        (\system -> not $
+          any (\mount -> within (destination mount) (destination system)) mounts)
+        inheritedSystemFiles
+  systemMounts <-
+    forM (zip [0 :: Int ..] systemFiles) $ \(index, mount) -> do
+    status <- getFileStatus (source mount)
+    -- Files produced by --ro-bind-data have no directory entry to re-bind.
+    -- Open and copy their contents into the next sandbox instead.
+    pure $ if linkCount status == 0
+      then (["--ro-bind-data", "<system-file-" ++ show index ++ "-fd>", destination mount],
+            Just (index, source mount))
+      else (mountArgs mount, Nothing)
+  resolverTarget <- if mode /= PrivateNetwork then pure "/etc/resolv.conf" else do
+    let hidden path = if shareFilesystem opts then any (`within` path) temporaryRoots
+                      else not $ any (`within` path) systemDirectories
+    target <- catchIOError (hiddenSystemTarget hidden "/etc/resolv.conf") $ \err ->
+      if isDoesNotExistError err then pure Nothing else ioError err
+    maybe (canonicalizePath "/etc/resolv.conf") pure target
   let destinations = map destination mounts
   unless (length destinations == length (nub destinations)) $
     invalid "duplicate volume destinations"
@@ -79,20 +140,23 @@ prepare opts = do
                   ("WORKCELL_ACTIVE", "1")] ++ locale
       cmd = if null (command opts)
         then ["/bin/bash"] else command opts
-      args = ["--die-with-parent"] ++ filesystem
+      beforeSystemFiles = ["--die-with-parent"] ++ filesystem
         ++ concatMap (\path -> ["--tmpfs", path]) temporaryRoots
         ++ ["--dev", "/dev"]
         ++ (if shareProcesses opts then ["--ro-bind", "/proc", "/proc"] else privateProcArgs)
         ++ ["--dir", home]
         ++ homeArgs
-        ++ concatMap mountArgs systemFiles
+      args = beforeSystemFiles ++ concatMap fst systemMounts
+        ++ ["--unshare-net" | mode /= HostNetwork]
         ++ concatMap mountArgs mounts
         ++ maybe [] (\path -> ["--bind", path, path]) project
         ++ ["--chdir", fromMaybe home project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
         ++ ["--"] ++ cmd
-  pure $ Launch args suppliedHome
+      copies = [(length beforeSystemFiles + index * 3 + 1, path) |
+                 (index, path) <- catMaybes $ map snd systemMounts]
+  pure $ Launch args suppliedHome mode resolverTarget copies
 
 privateProcArgs :: [String]
 privateProcArgs = ["--unshare-pid", "--proc", "/proc"]
@@ -145,9 +209,10 @@ filesystemArgs False = do
     ++ ["--perms", "1777", "--tmpfs", "/var/tmp"] ++ varHomeAlias
 
 -- Toolbx links these files into /run/host.  Mount only the files instead.
-preservedSystemFiles :: Bool -> IO [Mount]
-preservedSystemFiles shared = fmap concat $ forM
-  ["/etc/resolv.conf", "/etc/hosts", "/etc/host.conf", "/etc/localtime"] $ \path -> do
+preservedSystemFiles :: Bool -> Bool -> IO [Mount]
+preservedSystemFiles shared preserveResolver = fmap concat $ forM
+  (["/etc/resolv.conf" | preserveResolver] ++
+   ["/etc/hosts", "/etc/host.conf", "/etc/localtime"]) $ \path -> do
   exists <- doesPathExist path
   if not exists then pure [] else do
     resolved <- canonicalizePath path
