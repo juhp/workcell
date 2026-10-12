@@ -262,6 +262,18 @@ concurrent sessions, stale records, PID namespace scoping, and cleanup.
 To check actual internet access and DNS resolution on the host, run
 `workcell -- curl --max-time 15 -I https://example.com`.
 
+Run the tasty-bench startup benchmarks with Cabal:
+
+```sh
+cabal bench bench --benchmark-options='--timeout 5s'
+```
+
+The benchmarks measure wall-clock time for `--dryrun` and launching `/bin/true`,
+including process startup and cleanup. Both use `--network host` so pasta is not
+required. The live benchmark is skipped with a diagnostic if sandbox startup is
+unavailable. Cabal supplies the built executable; set `WORKCELL` to an absolute
+path to benchmark another binary.
+
 The original shell prototype is also available:
 
 ```sh
