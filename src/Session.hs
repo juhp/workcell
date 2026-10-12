@@ -14,7 +14,7 @@ import qualified Data.ByteString.Char8 as BSC
 import Data.Bits ((.&.))
 import Data.Char (isDigit, isAsciiLower, isAsciiUpper)
 import Data.List (intercalate, sort, transpose)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import GHC.Generics (Generic)
@@ -160,7 +160,7 @@ findCommandPID pid = do
         then pure $ Just candidate
         else do
           children <- words <$> strictRead (procPath candidate $ "task" </> show candidate </> "children")
-          results <- mapM (\child -> search $ read child) children
+          results <- mapM (search . read) children
           pure $ case catMaybes results of
             found:_ -> Just found
             [] -> Nothing
@@ -219,7 +219,7 @@ listSessions = do
   where
     row record =
       let details = sessionDetails record
-      in [sessionID record, maybe "-" id $ sessionProject details,
+      in [sessionID record, fromMaybe "-" $ sessionProject details,
          sessionNetwork details, unwords $ map quote $ sessionCommand details]
 
 foreign import ccall unsafe "ioctl"

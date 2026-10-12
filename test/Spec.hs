@@ -4,12 +4,13 @@ module Main (main) where
 
 import Control.Exception (bracket, throwIO)
 import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value(..), eitherDecodeStrict', encode)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
 import Data.List (isPrefixOf)
+import Data.Maybe (fromMaybe, isNothing)
 import qualified Network as WorkcellNetwork
 import qualified Session as WorkcellSession
 import qualified Network.Socket as Net
@@ -96,7 +97,7 @@ invoke :: Context -> Maybe Bool -> Maybe [(String, String)] -> [String]
 invoke ctx shared environment args = capture $
   (proc (binary ctx) (flags ++ args)) {cwd = Just (project ctx), env = environment}
   where
-    sharing = maybe (not (privateProc ctx) && "--dryrun" `notElem` args) id shared
+    sharing = fromMaybe (not (privateProc ctx) && "--dryrun" `notElem` args) shared
     explicitNetwork = any (\arg -> arg == "--network" || arg == "--share-network" ||
                           "--network=" `isPrefixOf` arg) (takeWhile (/= "--") args)
     flags = ["--share-processes" | sharing] ++
@@ -151,7 +152,7 @@ spec = describe "workcell CLI" $ do
 
   it "enters a running workcell without sudo and preserves its environment and filesystem" $ \ctx -> do
     helper <- findExecutable "nsenter"
-    when (helper == Nothing) $ pendingWith "nsenter unavailable"
+    when (isNothing helper) $ pendingWith "nsenter unavailable"
     withRunningSession ctx ["-e", "ENTRY_VALUE=hello world"] $ \ident -> do
       preview <- successful =<< sessionInvoke ctx ["--enter", ident, "--dryrun"]
       preview `shouldContain` "nsenter"
@@ -168,7 +169,7 @@ spec = describe "workcell CLI" $ do
       path <- case paths of
         [found] -> pure found
         _ -> fail "expected one session record"
-      fileMode <$> getFileStatus path >>= (\mode -> mode .&. 0o777 `shouldBe` 0o600)
+      getFileStatus path >>= (\mode -> mode .&. 0o777 `shouldBe` 0o600) . fileMode
       bytes <- BS.readFile path
       value <- either fail pure $ eitherDecodeStrict' bytes
       forM_ [("sessionStart", "invalid"), ("sessionBoot", "invalid"),
@@ -266,7 +267,7 @@ spec = describe "workcell CLI" $ do
                 "--tmpfs", "/tmp", "--tmpfs", "/run", "--", "/bin/sleep", "30"]
     bracket (createProcess $ (proc executable args) {env = Just environment})
       (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $ \_ -> do
-        found <- timeout (5 * 1000000) $ waitListed
+        found <- timeout (5 * 1000000) waitListed
         ident <- maybe (fail "private session was not registered") pure found
         output <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
           "cat /tmp/workcell-test-resolv; readlink /proc/self/ns/net; readlink /proc/self/ns/pid"]
@@ -489,7 +490,7 @@ spec = describe "workcell CLI" $ do
     invocation <- fakeHelperCommand ctx "echo fallback-diagnostic >&2\nexit 42" ["/bin/true"]
     environment <- getEnvironment
     let envs = setVariables [("HOME", root ctx), ("XDG_STATE_HOME", "relative-state")]
-          (maybe environment id $ env invocation)
+          (fromMaybe environment $ env invocation)
     (_, _, err) <- capture (invocation {env = Just envs})
     let directory = root ctx </> ".local/state/workcell/logs"
     err `shouldContain` directory
@@ -584,7 +585,7 @@ spec = describe "workcell CLI" $ do
     out <- success ctx ["-H", supplied, "--dryrun", "--", "/usr/bin/printf", "%s", quoted]
     doesPathExist supplied `shouldReturn` False
     -- Let the shell parse the printed invocation; no shell expansion of argv is allowed.
-    let flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
+    let flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
     runnable <- success ctx $ flags ++ ["--dryrun", "--", "/usr/bin/printf", "%s", quoted]
     out `shouldContain` "'--'"
     executed <- successful =<< capture ((proc "/bin/sh" ["-c", runnable]) {cwd = Just (project ctx)})
@@ -644,7 +645,7 @@ spec = describe "workcell CLI" $ do
     run supplied ["--", "locale", "charmap"] `shouldReturn` "UTF-8\n"
     run supplied ["-e", "LC_ALL=C", "--", "locale", "charmap"] >>= (`shouldNotBe` "UTF-8\n")
     absent <- run environment ["--", "env"]
-    lines absent `shouldSatisfy` all (not . localeVariable . takeWhile (/= '='))
+    lines absent `shouldSatisfy` (not . any (localeVariable . takeWhile (/= '=')))
 
   it "rejects invalid options, paths, mounts, and environment names" $ \ctx -> do
     let missing = root ctx </> "missing"
@@ -656,7 +657,7 @@ spec = describe "workcell CLI" $ do
           ["-e", "BAD-NAME=value"], ["-p", "/proc"], ["-v", "/etc:/proc"],
           ["-e", "WORKCELL_TEST_UNSET_82394"], ["--network", "invalid"],
           ["--network", "none", "--share-network"]]
-    forM_ cases $ \args -> failure ctx (args ++ ["--dryrun"]) >> pure ()
+    forM_ cases $ \args -> void (failure ctx (args ++ ["--dryrun"]))
 
   it "validates before creating persistent home" $ \ctx -> do
     let supplied = root ctx </> "must not be created"
@@ -672,7 +673,7 @@ spec = describe "workcell CLI" $ do
 
   it "omits implicit projects at home and its ancestors" $ \ctx -> do
     let supplied = root ctx </> "isolated home"
-        flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
+        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
     createDirectory supplied
     writeFile (supplied </> "marker") "isolated"
     forM_ [home ctx, takeDirectory (home ctx), "/"] $ \directory -> do
@@ -687,7 +688,7 @@ spec = describe "workcell CLI" $ do
 
   it "runs the installed GHC" $ \ctx -> do
     available <- findExecutable "ghc"
-    when (available == Nothing) $ pendingWith "GHC is not installed"
+    when (isNothing available) $ pendingWith "GHC is not installed"
     success ctx ["--", "ghc", "--version"] >>= (`shouldContain` "Glorious Glasgow Haskell")
 
   it "preserves individual system configuration files including binary localtime" $ \ctx -> do
@@ -767,16 +768,20 @@ spec = describe "workcell CLI" $ do
 
   it "starts when optional configuration files are absent or localtime is a dangling symlink" $ \ctx -> do
     let sparseEtc = root ctx </> "sparse etc"
-        flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
+        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
         args = ["--ro-bind", "/", "/", "--proc", "/proc", "--ro-bind", sparseEtc, "/etc",
                 "--", binary ctx] ++ flags ++
                ["--", "/bin/sh", "-c", "[ ! -e /etc/localtime ] && printf started"]
         check = do
           out <- successful =<< capture ((fixtureProcess args) {cwd = Just (project ctx)})
           out `shouldBe` "started"
-          dry <- successful =<< capture ((fixtureProcess
-            (["--ro-bind", "/", "/", "--proc", "/proc", "--ro-bind", sparseEtc, "/etc",
-              "--", binary ctx, "--network", "private", "--dryrun"])) {cwd = Just (project ctx)})
+          dry <- successful =<<
+                 capture
+                 ((fixtureProcess
+                   ["--ro-bind", "/", "/", "--proc", "/proc",
+                    "--ro-bind", sparseEtc, "/etc",
+                    "--", binary ctx, "--network", "private", "--dryrun"])
+                   {cwd = Just (project ctx)})
           dry `shouldContain` "'--ro-bind-data' '<dns-fd>' '/etc/resolv.conf'"
     createDirectory sparseEtc
     check
@@ -785,7 +790,7 @@ spec = describe "workcell CLI" $ do
 
   it "preserves localtime through hidden intermediate symlinks" $ \ctx -> do
     let sparseEtc = root ctx </> "sparse etc"
-        flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
+        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
         outer = ["--ro-bind", "/", "/", "--proc", "/proc",
                  "--bind", project ctx, project ctx,
                  "--ro-bind", sparseEtc, "/etc", "--tmpfs", "/run",
@@ -827,7 +832,7 @@ spec = describe "workcell CLI" $ do
 
   it "restores enclosing visibility only with share-filesystem" $ \ctx -> do
     let fixture = root ctx </> "outside"
-        flags = ["--share-network"] ++ ["--share-processes" | not (privateProc ctx)]
+        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
         outer = ["--ro-bind", "/", "/", "--proc", "/proc", "--tmpfs", "/opt",
                  "--ro-bind", fixture, "/opt/host-marker", "--", binary ctx]
     writeFile fixture "host data"
@@ -854,12 +859,16 @@ spec = describe "workcell CLI" $ do
     pure ()
 
 shellHome :: Context -> FilePath -> String -> IO ()
-shellHome ctx supplied script = success ctx
-  ["-H", supplied, "--", "/bin/sh", "-c", "set -eu\n" ++ script] >> pure ()
+shellHome ctx supplied script =
+  void $
+  success ctx
+  ["-H", supplied, "--", "/bin/sh", "-c", "set -eu\n" ++ script]
 
 volumeShell :: Context -> String -> String -> [String] -> IO ()
-volumeShell ctx volume script args = success ctx
-  (["-v", volume, "--", "/bin/sh", "-c", "set -eu\n" ++ script, "check"] ++ args) >> pure ()
+volumeShell ctx volume script args =
+  void $
+  success ctx
+  (["-v", volume, "--", "/bin/sh", "-c", "set -eu\n" ++ script, "check"] ++ args)
 
 localeVariable :: String -> Bool
 localeVariable key = key == "LANG" || key == "LANGUAGE" || "LC_" `isPrefixOf` key
@@ -903,7 +912,7 @@ fakeHelperCommand ctx script command = do
   invocation <- loopbackCommand ctx command
   environment <- getEnvironment
   pure invocation {env = Just $ setVariables [("PATH", tools ++ ":/usr/bin:/bin")]
-                    (maybe environment id $ env invocation)}
+                    (fromMaybe environment $ env invocation)}
 
 waitUntil :: IO Bool -> IO ()
 waitUntil condition = do

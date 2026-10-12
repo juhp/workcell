@@ -3,10 +3,10 @@ module Workcell (Options(..), runWorkcell) where
 
 import Control.Exception (bracket, throwTo)
 import Control.Concurrent (myThreadId)
-import Control.Monad (forM, unless, when)
+import Control.Monad (forM, unless, void, when)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork)
 import SimpleCmd (cmdFull, needProgram)
 import Session (SessionDetails(..), withSession, listSessions, enterSession)
@@ -53,11 +53,12 @@ data Launch = Launch
 
 runWorkcell :: Options -> IO ()
 runWorkcell opts
-  | listOption opts || enterOption opts /= Nothing = do
-      when (listOption opts && enterOption opts /= Nothing) $ invalid "--list and --enter cannot be combined"
-      when (projectOption opts /= Nothing || homeOption opts /= Nothing ||
+  | listOption opts || isJust (enterOption opts) = do
+      when (listOption opts && isJust (enterOption opts)) $
+        invalid "--list and --enter cannot be combined"
+      when (isJust (projectOption opts) || isJust (homeOption opts) ||
             not (null $ volumeOptions opts) || not (null $ environmentOptions opts) ||
-            shareProcesses opts || shareFilesystem opts || networkOption opts /= Nothing || shareNetwork opts) $
+            shareProcesses opts || shareFilesystem opts || isJust (networkOption opts) || shareNetwork opts) $
         invalid "session operations cannot be combined with launch options"
       if listOption opts
         then do
@@ -72,7 +73,7 @@ withTermination :: IO a -> IO a
 withTermination action = do
   thread <- myThreadId
   bracket (installHandler sigTERM (CatchOnce $ throwTo thread $ ExitFailure 143) Nothing)
-    (\previous -> installHandler sigTERM previous Nothing >> pure ()) $ const action
+    (\previous -> void (installHandler sigTERM previous Nothing)) $ const action
 
 launchWorkcell :: Options -> IO ()
 launchWorkcell opts = do
@@ -133,7 +134,7 @@ prepare opts = do
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
   home <- existingDirectory "HOME" originalHome
   rejectRoot "HOME" home
-  when (projectOption opts /= Nothing && within candidate home) $
+  when (isJust (projectOption opts) && within candidate home) $
     invalid "project must not cover HOME; select a project directory with --project"
   let project = if within candidate home then Nothing else Just candidate
   suppliedHome <- traverse resolveHome (homeOption opts)
@@ -198,7 +199,7 @@ prepare opts = do
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
         ++ ["--"] ++ cmd
       copies = [(length beforeSystemFiles + index * 3 + 1, path) |
-                 (index, path) <- catMaybes $ map snd systemMounts]
+                 (index, path) <- mapMaybe snd systemMounts]
   pure $ Launch args suppliedHome mode resolverTarget copies project
 
 privateProcArgs :: [String]

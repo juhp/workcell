@@ -24,7 +24,7 @@ main = do
   -- CPU time would exclude the time spent in workcell and bubblewrap.
   defaultMain
     [ localOption WallTime $
-        bgroup "workcell" $
-          [bench "dryrun" $ nfIO $ run ["--network", "host", "--dryrun", "--", "/bin/true"]] ++
-          [bench "run true" $ nfIO $ run launch | code == ExitSuccess]
+      bgroup "workcell" $
+      bench "dryrun" (nfIO $ run ["--network", "host", "--dryrun", "--", "/bin/true"]) :
+      [bench "run true" $ nfIO $ run launch | code == ExitSuccess]
     ]

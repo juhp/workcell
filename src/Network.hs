@@ -11,6 +11,7 @@ import Control.Monad (unless, void, when)
 import Data.Aeson (FromJSON(..), eitherDecodeStrict', withObject, (.:))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
+import Data.Maybe (isJust)
 import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import SimpleCmd (cmdFull)
@@ -42,7 +43,7 @@ data NetworkMode = PrivateNetwork | NoNetwork | HostNetwork
 
 networkMode :: Maybe String -> Bool -> IO NetworkMode
 networkMode option shared = do
-  when (shared && option /= Nothing) $
+  when (shared && isJust option) $
     invalid "--share-network and --network cannot be combined"
   case (shared, option) of
     (True, _) -> pure HostNetwork
@@ -64,7 +65,7 @@ verifyNetwork HostNetwork _ = pure ()
 verifyNetwork mode processArgs = do
   when (mode == PrivateNetwork) $ do
     pasta <- findExecutable "pasta"
-    unless (pasta /= Nothing) $
+    unless (isJust pasta) $
       unavailable "pasta is not installed or not on PATH"
     tun <- doesPathExist "/dev/net/tun"
     unless tun $ unavailable "/dev/net/tun is unavailable in the enclosing environment"
@@ -224,8 +225,10 @@ runNetwork track logHandle extraPastaArgs args resolverDestination = do
       (namespaceIoctl fd getOwnerNamespace 0)
 
 withChild :: CreateProcess -> (ProcessHandle -> IO a) -> IO a
-withChild command action = bracket
-  (createProcess command >>= \(_, _, _, handle) -> pure handle) stopChild action
+withChild command =
+  bracket
+  (createProcess command >>= \(_, _, _, handle) -> pure handle)
+  stopChild
 
 stopChild :: ProcessHandle -> IO ()
 stopChild handle = do
@@ -276,7 +279,7 @@ waitReady pidfile child helper = do
   ready <- doesFileExist pidfile
   content <- if ready then readFile pidfile else pure ""
   _ <- evaluate $ length content
-  if null content then threadDelay 10000 >> waitReady pidfile child helper else pure ()
+  when (null content) $ threadDelay 10000 >> waitReady pidfile child helper
 
 waitCommand :: ProcessHandle -> ProcessHandle -> IO ExitCode
 waitCommand child helper = do
