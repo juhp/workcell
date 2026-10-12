@@ -3,7 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 -- SPDX-License-Identifier: BSD-3-Clause
 module Network
-  (NetworkMode(..), networkMode, pastaArguments, verifyNetwork, runPrivateNetwork) where
+  (NetworkMode(..), networkMode, pastaArguments, verifyNetwork, runPrivateNetwork, runTrackedPrivateNetwork, runTrackedSandbox, withChild) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket, evaluate)
@@ -114,7 +114,7 @@ runPrivateNetwork = runLoggedNetwork False
 runLoggedNetwork :: Bool -> [String] -> [String] -> FilePath -> IO ExitCode
 runLoggedNetwork discardSuccess extraPastaArgs args resolverDestination =
   withPastaLog discardSuccess $ \logHandle ->
-    runNetwork logHandle extraPastaArgs args resolverDestination
+    runNetwork (\_ action -> action) logHandle extraPastaArgs args resolverDestination
 
 withPastaLog :: Bool -> (Handle -> IO ExitCode) -> IO ExitCode
 withPastaLog discardSuccess action = bracket acquire (hClose . snd) $ \(path, handle) -> do
@@ -151,8 +151,36 @@ diagnosticTail path = withBinaryFile path ReadMode $ \handle -> do
   let recent = lines $ BSC.unpack bytes
   pure $ unlines $ drop (max 0 $ length recent - 20) recent
 
-runNetwork :: Handle -> [String] -> [String] -> FilePath -> IO ExitCode
-runNetwork logHandle extraPastaArgs args resolverDestination = do
+-- The callback brackets session registration around the running command.
+runTrackedPrivateNetwork :: (Int -> IO ExitCode -> IO ExitCode) -> [String] -> [String] -> FilePath -> IO ExitCode
+runTrackedPrivateNetwork track extraArgs args destination =
+  withPastaLog False $ \handle -> runNetwork track handle extraArgs args destination
+
+runTrackedSandbox :: (Int -> IO ExitCode -> IO ExitCode) -> [String] -> IO ExitCode
+runTrackedSandbox track args = do
+  tmp <- getTemporaryDirectory
+  bracket (mkdtemp $ tmp </> "workcell-session-") removePathForcibly $ \dir -> do
+    let ready = dir </> "ready"
+        inside = "/run/workcell-session-ready"
+        (mounts, command) = break (== "--") args
+        script = "if IFS= read -r ready < \"$1\" && [ \"$ready\" = ready ]; then shift; exec \"$@\"; fi; exit 1"
+    createNamedPipe ready 0o600
+    bracket (openFd ready ReadWrite defaultFileFlags) closeFd $ \gate ->
+      withPipe $ \(_, output, reader, writer) -> do
+        let argv = ["--info-fd", show output] ++ mounts ++
+              ["--ro-bind", ready, inside, "--", "/bin/sh", "-c", script,
+               "workcell-session", inside] ++ drop 1 command
+        withChild ((proc "bwrap" argv) {delegate_ctlc = True, close_fds = False}) $ \child -> do
+          hClose writer
+          info <- deadline "waiting for bubblewrap namespace setup" $ BS.hGetContents reader
+          SandboxInfo pid <- either (invalid . ("invalid bubblewrap namespace info: " ++)) pure $
+            eitherDecodeStrict' info
+          track pid $ do
+            void $ fdWrite gate "ready\n"
+            waitForProcess child
+
+runNetwork :: (Int -> IO ExitCode -> IO ExitCode) -> Handle -> [String] -> [String] -> FilePath -> IO ExitCode
+runNetwork track logHandle extraPastaArgs args resolverDestination = do
   tmp <- getTemporaryDirectory
   bracket (mkdtemp $ tmp </> "workcell-network-") removePathForcibly $ \dir -> do
     let readyPipe = dir </> "ready"
@@ -188,8 +216,9 @@ runNetwork logHandle extraPastaArgs args resolverDestination = do
                      std_err = UseHandle logHandle, close_fds = True}
               withChild helper $ \network -> do
                 deadline "waiting for pasta network setup" $ waitReady pidfile child network
-                void $ fdWrite gate "ready\n"
-                waitCommand child network
+                track pid $ do
+                  void $ fdWrite gate "ready\n"
+                  waitCommand child network
   where
     ownerNamespace (Fd fd) = Fd <$> throwErrnoIfMinus1 "network namespace owner"
       (namespaceIoctl fd getOwnerNamespace 0)

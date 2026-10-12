@@ -1,21 +1,23 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 module Workcell (Options(..), runWorkcell) where
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, throwTo)
+import Control.Concurrent (myThreadId)
 import Control.Monad (forM, unless, when)
 import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (catMaybes, fromMaybe)
-import Network (NetworkMode(..), networkMode, pastaArguments, runPrivateNetwork, verifyNetwork)
+import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork)
 import SimpleCmd (cmdFull, needProgram)
+import Session (SessionDetails(..), withSession, listSessions, enterSession)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
-import System.Exit (exitWith)
+import System.Exit (ExitCode(..), exitWith)
+import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.IO.Error (catchIOError, isDoesNotExistError)
-import System.Posix.Process (executeFile)
 import System.Posix.Files (getFileStatus, linkCount)
 import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
 
@@ -29,6 +31,8 @@ data Options = Options
   , shareFilesystem :: Bool
   , networkOption :: Maybe String
   , shareNetwork :: Bool
+  , listOption :: Bool
+  , enterOption :: Maybe String
   , command :: [String]
   }
 
@@ -44,10 +48,34 @@ data Launch = Launch
   , selectedNetwork :: NetworkMode
   , resolverDestination :: FilePath
   , copiedSystemFiles :: [(Int, FilePath)]
+  , launchProject :: Maybe FilePath
   }
 
 runWorkcell :: Options -> IO ()
-runWorkcell opts = do
+runWorkcell opts
+  | listOption opts || enterOption opts /= Nothing = do
+      when (listOption opts && enterOption opts /= Nothing) $ invalid "--list and --enter cannot be combined"
+      when (projectOption opts /= Nothing || homeOption opts /= Nothing ||
+            not (null $ volumeOptions opts) || not (null $ environmentOptions opts) ||
+            shareProcesses opts || shareFilesystem opts || networkOption opts /= Nothing || shareNetwork opts) $
+        invalid "session operations cannot be combined with launch options"
+      if listOption opts
+        then do
+          when (dryRun opts || not (null $ command opts)) $ invalid "--list does not accept --dryrun or a command"
+          listSessions
+        else maybe (invalid "missing session ID")
+          (\ident -> withTermination $ enterSession ident (dryRun opts) (command opts)) (enterOption opts)
+  | otherwise = withTermination $ launchWorkcell opts
+
+-- Turn termination into an exception so session/helper brackets can clean up.
+withTermination :: IO a -> IO a
+withTermination action = do
+  thread <- myThreadId
+  bracket (installHandler sigTERM (CatchOnce $ throwTo thread $ ExitFailure 143) Nothing)
+    (\previous -> installHandler sigTERM previous Nothing >> pure ()) $ const action
+
+launchWorkcell :: Options -> IO ()
+launchWorkcell opts = do
   launch <- prepare opts
   if dryRun opts
     then if selectedNetwork launch == PrivateNetwork || not (null $ copiedSystemFiles launch)
@@ -76,9 +104,19 @@ runWorkcell opts = do
         let liveArgs = [fromMaybe arg (lookup index descriptors) |
                         (index, arg) <- zip [0..] (arguments launch)]
         mapM_ (createDirectoryIfMissing True) (persistentHome launch)
-        if selectedNetwork launch == PrivateNetwork
-          then runPrivateNetwork [] liveArgs (resolverDestination launch) >>= exitWith
-          else executeFile "bwrap" True liveArgs Nothing
+        let mode = selectedNetwork launch
+            modeName = case mode of
+              PrivateNetwork -> "private"
+              NoNetwork -> "none"
+              HostNetwork -> "host"
+            details = SessionDetails (launchProject launch)
+              (if null (command opts) then ["/bin/bash"] else command opts)
+              modeName (shareProcesses opts)
+            track = withSession details
+        result <- if mode == PrivateNetwork
+          then runTrackedPrivateNetwork track [] liveArgs (resolverDestination launch)
+          else runTrackedSandbox track liveArgs
+        exitWith result
 
 withSystemFiles :: [(Int, FilePath)] -> ([(Int, String)] -> IO a) -> IO a
 withSystemFiles [] action = action []
@@ -161,13 +199,12 @@ prepare opts = do
         ++ ["--"] ++ cmd
       copies = [(length beforeSystemFiles + index * 3 + 1, path) |
                  (index, path) <- catMaybes $ map snd systemMounts]
-  pure $ Launch args suppliedHome mode resolverTarget copies
+  pure $ Launch args suppliedHome mode resolverTarget copies project
 
 privateProcArgs :: [String]
 privateProcArgs = ["--unshare-pid", "--proc", "/proc"]
 
 -- Check before creating a persistent home or running the requested command.
--- Keep exec for the real launch so terminal handling and exit status are unchanged.
 verifyProcessIsolation :: IO ()
 verifyProcessIsolation = do
   (ok, _, err) <- cmdFull "bwrap"

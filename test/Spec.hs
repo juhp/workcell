@@ -1,12 +1,17 @@
+{-# LANGUAGE OverloadedStrings #-}
 -- SPDX-License-Identifier: LGPL-2.1-or-later
 module Main (main) where
 
 import Control.Exception (bracket, throwIO)
 import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Monad (forM_, unless, when)
+import Data.Aeson (Value(..), eitherDecodeStrict', encode)
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
 import Data.List (isPrefixOf)
 import qualified Network as WorkcellNetwork
+import qualified Session as WorkcellSession
 import qualified Network.Socket as Net
 import System.Directory hiding (executable)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
@@ -17,6 +22,7 @@ import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
+import System.Posix.Signals (signalProcess, sigKILL)
 import System.Process hiding (shell)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -35,6 +41,10 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
+    "--test-tracked-loopback-network":bwrapArgs ->
+      WorkcellNetwork.runTrackedPrivateNetwork
+        (WorkcellSession.withSession $ WorkcellSession.SessionDetails Nothing ["sleep", "30"] "private" False)
+        ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
     "--test-loopback-network":bwrapArgs ->
       WorkcellNetwork.runPrivateNetwork ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
     _ -> testMain
@@ -113,6 +123,159 @@ shell ctx script args = do
 
 spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
+  it "lists no sessions and rejects conflicting session options without launching" $ \ctx -> do
+    sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+    forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"],
+           ["--list", "--", "/bin/true"], ["--enter", "s123", "-H", "unwanted"]] $ \args -> do
+      (code, _, _) <- sessionInvoke ctx args
+      code `shouldNotBe` ExitSuccess
+    (code, _, err) <- sessionInvoke ctx ["--enter", "s123"]
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "unknown or expired"
+    doesDirectoryExist (project ctx </> "unwanted") >>= (`shouldBe` False)
+
+  it "tracks concurrent sessions and removes records on termination" $ \ctx -> do
+    withRunningSession ctx [] $ \first -> do
+      withRunningSession ctx [] $ \second -> do
+        first `shouldNotBe` second
+        output <- successful =<< sessionInvoke ctx ["--list"]
+        output `shouldContain` first
+        output `shouldContain` second
+        output `shouldContain` project ctx
+        output `shouldContain` "host"
+      output <- successful =<< sessionInvoke ctx ["--list"]
+      output `shouldContain` first
+      length (lines output) `shouldBe` 2
+    sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+    sessionRecordPaths ctx >>= (`shouldBe` [])
+
+  it "enters a running workcell without sudo and preserves its environment and filesystem" $ \ctx -> do
+    helper <- findExecutable "nsenter"
+    when (helper == Nothing) $ pendingWith "nsenter unavailable"
+    withRunningSession ctx ["-e", "ENTRY_VALUE=hello world"] $ \ident -> do
+      preview <- successful =<< sessionInvoke ctx ["--enter", ident, "--dryrun"]
+      preview `shouldContain` "nsenter"
+      preview `shouldContain` "--mount="
+      out <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
+        "printf '%s\\n' \"$WORKCELL_ACTIVE\" \"$ENTRY_VALUE\" \"$PWD\" \"$1\"; test -f entry-home-marker; test -f \"$HOME/entry-home-marker\"", "check", "literal argument"]
+      lines out `shouldBe` ["1", "hello world", project ctx, "literal argument"]
+      (code, _, _) <- sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c", "exit 23"]
+      code `shouldBe` ExitFailure 23
+
+  it "ignores stale, mismatched, malformed and publicly readable session records" $ \ctx -> do
+    withRunningSession ctx [] $ \ident -> do
+      paths <- sessionRecordPaths ctx
+      path <- case paths of
+        [found] -> pure found
+        _ -> fail "expected one session record"
+      fileMode <$> getFileStatus path >>= (\mode -> mode .&. 0o777 `shouldBe` 0o600)
+      bytes <- BS.readFile path
+      value <- either fail pure $ eitherDecodeStrict' bytes
+      forM_ [("sessionStart", "invalid"), ("sessionBoot", "invalid"),
+             ("sessionMountNamespace", "mnt:[0]"), ("sessionPIDNamespace", "pid:[0]")] $ \(key, text) -> do
+        case value of
+          Object object -> BL.writeFile path $ encode $ Object $ KM.insert key (String text) object
+          _ -> expectationFailure "invalid session record"
+        sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+        (code, _, _) <- sessionInvoke ctx ["--enter", ident]
+        code `shouldNotBe` ExitSuccess
+      BS.writeFile path bytes
+      setFileMode path 0o644
+      sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+      setFileMode path 0o600
+      writeFile path "invalid JSON"
+      sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+
+  it "scopes discovery to the caller's PID namespace" $ \ctx -> do
+    withRunningSession ctx [] $ \_ -> do
+      paths <- sessionRecordPaths ctx
+      let other = root ctx </> "session-runtime/workcell/sessions/other-namespace"
+      createDirectory other
+      case paths of
+        [path] -> copyFile path (other </> "s999")
+        _ -> fail "expected one session record"
+      output <- successful =<< sessionInvoke ctx ["--list"]
+      length (lines output) `shouldBe` 2
+      output `shouldNotContain` "s999"
+
+  it "ignores records left by an uncatchable supervisor stop" $ \ctx -> do
+    withRunningSessionHandle ctx [] $ \ident handle -> do
+      pid <- getPid handle >>= maybe (fail "supervisor exited unexpectedly") pure
+      signalProcess sigKILL pid
+      _ <- waitForProcess handle
+      sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
+      paths <- sessionRecordPaths ctx
+      length paths `shouldBe` 1
+      (code, _, _) <- sessionInvoke ctx ["--enter", ident]
+      code `shouldNotBe` ExitSuccess
+
+  it "removes records after normal exit and creates none for failed setup or dry runs" $ \ctx -> do
+    environment <- sessionEnvironment ctx
+    let flags = ["--share-processes" | not $ privateProc ctx]
+        run args = capture $ (proc (binary ctx) (flags ++ args))
+          {cwd = Just (project ctx), env = Just environment}
+    _ <- successful =<< run ["--network", "host", "--", "/bin/true"]
+    sessionRecordPaths ctx >>= (`shouldBe` [])
+    _ <- successful =<< run ["--network", "host", "--dryrun"]
+    sessionRecordPaths ctx >>= (`shouldBe` [])
+    (code, _, _) <- run ["--network", "host", "-v", "/missing-session-test"]
+    code `shouldNotBe` ExitSuccess
+    sessionRecordPaths ctx >>= (`shouldBe` [])
+
+  it "uses state storage when the runtime directory is unset" $ \ctx -> do
+    environment <- sessionEnvironment ctx
+    let flags = ["--share-processes" | not $ privateProc ctx]
+    _ <- successful =<< capture ((proc (binary ctx) (flags ++ ["--network", "host", "--", "/bin/true"]))
+      {cwd = Just (project ctx), env = Just $ filter ((/= "XDG_RUNTIME_DIR") . fst) environment})
+    doesDirectoryExist (root ctx </> "session-state/workcell/sessions") >>= (`shouldBe` True)
+
+  it "uses writable fixture storage when enclosing TMPDIR points into a read-only mount" $ \ctx -> do
+    environment <- getEnvironment
+    let temporary = root ctx </> "enclosing temporary directory"
+        flags = ["--share-processes" | not $ privateProc ctx]
+        args = ["--ro-bind", "/", "/", "--proc", "/proc",
+                "--bind", project ctx, project ctx, "--", binary ctx] ++
+               flags ++ ["--network", "host", "--", "/bin/true"]
+    createDirectory temporary
+    _ <- successful =<< capture ((fixtureProcess args)
+      {cwd = Just (project ctx), env = Just $ setVariables [("TMPDIR", temporary)] environment})
+    pure ()
+
+  it "enters offline namespaces and respects shared process mode" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "network namespaces unavailable"
+    withRunningSession ctx ["--network", "none", "--share-processes"] $ \ident -> do
+      preview <- successful =<< sessionInvoke ctx ["--enter", ident, "--dryrun"]
+      preview `shouldContain` "--net="
+      preview `shouldNotContain` "--pid="
+      out <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
+        "readlink /proc/self/ns/net"]
+      out `shouldContain` "net:["
+
+  it "registers and enters the private-network supervisor with a real loopback pasta helper" $ \ctx -> do
+    requireLoopbackPasta
+    unless (privateProc ctx) $ pendingWith "private /proc unavailable"
+    executable <- getExecutablePath
+    environment <- sessionEnvironment ctx
+    let waitListed = do
+          output <- successful =<< sessionInvoke ctx ["--list"]
+          case drop 1 $ lines output of
+            row:_ | ident:_ <- words row -> pure ident
+            _ -> threadDelay 10000 >> waitListed
+        args = ["--test-tracked-loopback-network", "--die-with-parent", "--ro-bind", "/", "/",
+                "--dev", "/dev", "--unshare-net", "--unshare-pid", "--proc", "/proc",
+                "--tmpfs", "/tmp", "--tmpfs", "/run", "--", "/bin/sleep", "30"]
+    bracket (createProcess $ (proc executable args) {env = Just environment})
+      (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $ \_ -> do
+        found <- timeout (5 * 1000000) $ waitListed
+        ident <- maybe (fail "private session was not registered") pure found
+        output <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
+          "cat /tmp/workcell-test-resolv; readlink /proc/self/ns/net; readlink /proc/self/ns/pid"]
+        output `shouldContain` "nameserver 169.254.1.1"
+        outerNet <- readSymbolicLink "/proc/self/ns/net"
+        outerPID <- readSymbolicLink "/proc/self/ns/pid"
+        output `shouldNotContain` outerNet
+        output `shouldNotContain` outerPID
+
   it "provides help, version, shell defaults, and distinct dry-run modes" $ \ctx -> do
     success ctx ["--help"] >>= (`shouldContain` "--volume")
     success ctx ["--version"] >>= (`shouldBe` "0.1.0\n")
@@ -352,7 +515,7 @@ spec = describe "workcell CLI" $ do
     when (privateNet ctx) $ do
       _ <- successful =<< invoke ctx Nothing (Just envs) ["--network", "none", "--", "/bin/true"]
       pure ()
-    doesPathExist (root ctx </> "state") `shouldReturn` False
+    doesPathExist (root ctx </> "state/workcell/logs") `shouldReturn` False
 
   it "discards successful preflight logs but retains failed preflight diagnostics" $ \ctx -> do
     unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
@@ -561,7 +724,7 @@ spec = describe "workcell CLI" $ do
             inner = processFlags ++ ["--network", mode, "-v", binary ctx] ++ volume ++ ["--", binary ctx] ++
               processFlags ++ ["--share-network", "--", "/bin/sh", "-ec", script,
                                "check", "<system-file-0-fd>"]
-        _ <- successful =<< capture ((proc "bwrap" (outer ++ inner))
+        _ <- successful =<< capture ((fixtureProcess (outer ++ inner))
                                       {cwd = Just (project ctx), close_fds = False})
         BS.readFile (project ctx </> "localtime-copy") `shouldReturn` (if override then replaced else expected)
 
@@ -581,7 +744,7 @@ spec = describe "workcell CLI" $ do
                    "--bind", project ctx, project ctx, "--ro-bind", sparseEtc, "/etc",
                    "--tmpfs", "/run", "--ro-bind", resolverDir, directory] ++
                   (if toolbox then ["--symlink", target, link] else []) ++ ["--", binary ctx]
-          run args = successful =<< capture ((proc "bwrap" (outer ++ flags ++ args))
+          run args = successful =<< capture ((fixtureProcess (outer ++ flags ++ args))
                                               {cwd = Just (project ctx)})
       createFileLink link (sparseEtc </> "resolv.conf")
       forM_ [False, True] $ \shared ->
@@ -609,9 +772,9 @@ spec = describe "workcell CLI" $ do
                 "--", binary ctx] ++ flags ++
                ["--", "/bin/sh", "-c", "[ ! -e /etc/localtime ] && printf started"]
         check = do
-          out <- successful =<< capture ((proc "bwrap" args) {cwd = Just (project ctx)})
+          out <- successful =<< capture ((fixtureProcess args) {cwd = Just (project ctx)})
           out `shouldBe` "started"
-          dry <- successful =<< capture ((proc "bwrap"
+          dry <- successful =<< capture ((fixtureProcess
             (["--ro-bind", "/", "/", "--proc", "/proc", "--ro-bind", sparseEtc, "/etc",
               "--", binary ctx, "--network", "private", "--dryrun"])) {cwd = Just (project ctx)})
           dry `shouldContain` "'--ro-bind-data' '<dns-fd>' '/etc/resolv.conf'"
@@ -638,7 +801,7 @@ spec = describe "workcell CLI" $ do
       let args = outer ++ flags ++ ["--share-filesystem" | shared] ++
             ["--", "/bin/sh", "-ec",
              "cat /etc/localtime > configuration-copy; [ ! -e /run/host/etc/unrelated ]"]
-      _ <- successful =<< capture ((proc "bwrap" args) {cwd = Just (project ctx)})
+      _ <- successful =<< capture ((fixtureProcess args) {cwd = Just (project ctx)})
       BS.readFile (project ctx </> "configuration-copy") `shouldReturn` expected
 
   it "hides enclosing data and provides ephemeral writable var/tmp" $ \ctx -> do
@@ -671,7 +834,7 @@ spec = describe "workcell CLI" $ do
     forM_ [False, True] $ \shared -> do
       let args = outer ++ flags ++ ["--share-filesystem" | shared] ++
             ["--", "/bin/sh", "-c", if shared then "[ -f /opt/host-marker ]" else "[ ! -e /opt/host-marker ]"]
-      _ <- successful =<< capture ((proc "bwrap" args) {cwd = Just (project ctx)})
+      _ <- successful =<< capture ((fixtureProcess args) {cwd = Just (project ctx)})
       pure ()
     _ <- success ctx ["--share-filesystem", "--", "/bin/sh", "-c",
                       "[ ! -e \"$1\" ] && printf saved > shared-write", "check", fixture]
@@ -749,3 +912,64 @@ waitUntil condition = do
         unless done $ threadDelay 10000 >> wait
   timeout (10 * 1000000) wait >>= maybe (expectationFailure "condition timed out") pure
 
+
+-- Session operations must not inherit invoke's launch-only sharing flags.
+sessionEnvironment :: Context -> IO [(String, String)]
+sessionEnvironment ctx = do
+  environment <- getEnvironment
+  pure $ [("XDG_RUNTIME_DIR", root ctx </> "session-runtime"),
+          ("XDG_STATE_HOME", root ctx </> "session-state")] ++
+    filter (\(key, _) -> key `notElem` ["XDG_RUNTIME_DIR", "XDG_STATE_HOME"]) environment
+
+sessionInvoke :: Context -> [String] -> IO (ExitCode, String, String)
+sessionInvoke ctx args = do
+  environment <- sessionEnvironment ctx
+  capture $ (proc (binary ctx) args) {cwd = Just (project ctx), env = Just environment}
+
+sessionRecordPaths :: Context -> IO [FilePath]
+sessionRecordPaths ctx = do
+  let parent = root ctx </> "session-runtime/workcell/sessions"
+  namespaces <- listDirectory parent
+  concat <$> mapM (\ns -> do
+    let dir = parent </> ns
+    names <- listDirectory dir
+    pure [dir </> name | name <- names, "s" `isPrefixOf` name]) namespaces
+
+withRunningSession :: Context -> [String] -> (String -> IO a) -> IO a
+withRunningSession ctx extra action =
+  withRunningSessionHandle ctx extra $ \ident _ -> action ident
+
+withRunningSessionHandle :: Context -> [String] -> (String -> ProcessHandle -> IO a) -> IO a
+withRunningSessionHandle ctx extra action = do
+  environment <- sessionEnvironment ctx
+  existing <- lines <$> (successful =<< sessionInvoke ctx ["--list"])
+  let args = (if "--network" `elem` extra then [] else ["--network", "host"]) ++
+        ["--share-processes" | not (privateProc ctx) && "--share-processes" `notElem` extra] ++
+        ["-H", root ctx </> "session-home"] ++ extra ++
+        ["--", "/bin/sh", "-c", "touch entry-home-marker \"$HOME/entry-home-marker\"; exec sleep 30"]
+  bracket (createProcess $ (proc (binary ctx) args)
+    {cwd = Just (project ctx), env = Just environment, std_out = NoStream})
+    (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $ \(_, _, _, handle) -> do
+      found <- timeout (5 * 1000000) $ waitForSession existing handle
+      ident <- maybe (fail "session did not become ready") pure found
+      action ident handle
+  where
+    waitForSession existing handle = do
+      status <- getProcessExitCode handle
+      case status of
+        Just code -> fail $ "workcell exited before registration: " ++ show code
+        Nothing -> pure ()
+      output <- successful =<< sessionInvoke ctx ["--list"]
+      marker <- doesFileExist $ project ctx </> "entry-home-marker"
+      -- Select the most recently added record, rather than an existing session.
+      case filter (`notElem` existing) (drop 1 $ lines output) of
+        row:_ | marker, ident:_ <- words row -> pure ident
+        _ -> threadDelay 10000 >> waitForSession existing handle
+
+-- Read-only enclosing fixtures need writable storage for supervision and records.
+fixtureProcess :: [String] -> CreateProcess
+fixtureProcess args =
+  let (mounts, command) = break (== "--") args
+  in proc "bwrap" $ mounts ++
+    ["--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp",
+     "--setenv", "XDG_RUNTIME_DIR", "/tmp/workcell-fixture-runtime"] ++ command

@@ -28,4 +28,6 @@ options = Options
   <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"
   <*> optional (strOptionLongWith "network" "MODE" "Networking: private (default, requires pasta), none, or host")
   <*> switchLongWith "share-network" "Share the enclosing network (alias for --network host)"
+  <*> switchLongWith "list" "List active workcells in this PID namespace"
+  <*> optional (strOptionLongWith "enter" "ID" "Enter an active workcell without sudo (see --list)")
   <*> many (strArg "COMMAND ARG...")

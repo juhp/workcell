@@ -29,6 +29,47 @@ workcell --share-network -- curl localhost:8000 # share enclosing network
 workcell -v /path/to/data:/opt/data:ro -- ls /opt/data
 ```
 
+## Entering an active workcell
+
+From another terminal in the same enclosing environment:
+
+```sh
+workcell --list
+workcell --enter s123456               # use an ID from --list; starts Bash
+workcell --enter s123456 -- git status
+workcell --enter s123456 --dryrun
+```
+
+Entry requires `nsenter` (from util-linux) and runs without sudo. It starts an
+additional command using the session's filesystem root, working directory,
+initial command environment, and isolated process/network namespaces. Shared
+process or network namespaces are left unchanged. Session operations cannot be
+combined with launch options such as `--home`, `--volume`, or `--network`.
+
+Records are stored beneath `$XDG_RUNTIME_DIR/workcell/sessions/<pid-namespace-id>/`.
+When no absolute runtime directory is configured, workcell uses
+`$XDG_STATE_HOME/workcell/sessions/`, or `~/.local/state/workcell/sessions/` if
+that variable is also unset or relative, with the same namespace subdirectory.
+Session directories are mode 0700 and records are mode 0600; records contain
+launch metadata but no environment values. Launch supervision also requires a
+writable enclosing temporary directory.
+
+Listing and entry validate the PID, process start time, boot ID, and namespace
+identity. Normal exit and termination remove the record; an uncatchable stop
+may leave a stale record, which is ignored. Only sessions started by this
+version are registered. Discovery is scoped to the caller's PID namespace:
+sharing a runtime directory between toolboxes does not by itself allow entry
+from another PID or user namespace. Namespace permissions still apply.
+
+Entry can appear as UID 0 in the namespace owning the filesystem. This maps to
+your enclosing user and does not grant host-root identity. It joins namespaces;
+it does not automatically inherit seccomp filters or resource limits from the
+original command. For manual host-root entry, use a host-visible command PID:
+
+```sh
+sudo nsenter --target PID --mount --net --pid --root --wd -- /bin/bash
+```
+
 `-p/--project` defaults to the current directory. The project is mounted writable
 at its original absolute path (resolved through symlinks); commands start there.
 Edits and deletions affect the original project immediately.
@@ -216,6 +257,8 @@ private-mode startup failures. The real pasta supervisor is also tested in
 loopback-only mode to verify identity, DNS/argv handling, and cleanup without a
 TUN device. Tests requiring a TUN-backed private network are pending when the enclosing
 environment lacks the helper, TUN device, or working namespace support.
+Session checks cover entry without sudo, environment and namespace preservation,
+concurrent sessions, stale records, PID namespace scoping, and cleanup.
 To check actual internet access and DNS resolution on the host, run
 `workcell -- curl --max-time 15 -I https://example.com`.
 
