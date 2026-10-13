@@ -139,6 +139,21 @@ workcell --x11 -- xterm
 X11 access permits broad interaction with other X clients, including input and
 clipboard access. Audio, GPU devices, and desktop D-Bus remain separate.
 
+`--dbus` exposes the desktop session bus socket and sets
+`DBUS_SESSION_BUS_ADDRESS` to its sandbox location, `/run/workcell-session-bus`.
+It requires an existing socket identified by a single `unix:path=...` address
+in the enclosing `DBUS_SESSION_BUS_ADDRESS`; an optional `guid` and escaped
+path bytes are supported. Abstract sockets, TCP addresses, and address lists
+are unsupported. Explicit `-e` settings can override the forwarded address.
+It can be combined with `--wayland` and `--x11`.
+
+```sh
+workcell --wayland --dbus -- gtk4-demo
+```
+
+This shares the session bus directly, without filtering services or methods.
+The system bus is not exposed.
+
 Use `WORKCELL_ACTIVE` to detect workcell in your shell configuration.
 For example, add this after setting `PS1` in the `.bashrc` used by
 your workcell home:

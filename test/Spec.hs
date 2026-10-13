@@ -127,7 +127,7 @@ spec = describe "workcell CLI" $ do
   it "lists no sessions and rejects conflicting session options without launching" $ \ctx -> do
     sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
     forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"],
-           ["--list", "--wayland"], ["--list", "--x11"],
+           ["--list", "--wayland"], ["--list", "--x11"], ["--list", "--dbus"],
            ["--list", "--", "/bin/true"], ["--enter", "s123", "-H", "unwanted"]] $ \args -> do
       (code, _, _) <- sessionInvoke ctx args
       code `shouldNotBe` ExitSuccess
@@ -725,6 +725,56 @@ spec = describe "workcell CLI" $ do
     check [] [] "--x11 requires DISPLAY"
     forM_ ["", "localhost:10.0", "host:0", ":", ":0.", ":0.bad", ":0.1.2", ":-1"] $ \display ->
       check [("DISPLAY", display)] [] "--x11 requires a local DISPLAY"
+
+  it "exposes only the D-Bus session socket and accumulates desktop settings" $ \ctx -> do
+    environment <- getEnvironment
+    let directory = root ctx </> "bus-runtime"
+        socket = directory </> "bus"
+        encoded = concatMap (\c -> if c == ' ' then "%20" else [c]) socket
+        address = "unix:path=" ++ encoded
+        supplied value = setVariables [("DBUS_SESSION_BUS_ADDRESS", value),
+          ("XDG_RUNTIME_DIR", directory), ("WAYLAND_DISPLAY", "bus")] environment
+    createDirectory directory
+    writeFile (directory </> "private-marker") "hidden"
+    bracket (Net.socket Net.AF_UNIX Net.Stream Net.defaultProtocol) Net.close $ \listener -> do
+      Net.bind listener $ Net.SockAddrUnix socket
+      forM_ [address, address ++ ",guid=0123456789abcdef0123456789abcdef",
+             "unix:guid=0123456789abcdef0123456789abcdef,path=" ++ encoded] $ \value -> do
+        out <- successful =<< invoke ctx Nothing (Just $ supplied value)
+          ["--dbus", "--", "/bin/sh", "-c", unlines
+           ["set -eu", "test -S /run/workcell-session-bus",
+            "test ! -e \"$1/private-marker\"", "echo \"$DBUS_SESSION_BUS_ADDRESS\""],
+           "check", directory]
+        out `shouldBe` "unix:path=/run/workcell-session-bus\n"
+      out <- successful =<< invoke ctx Nothing (Just $ supplied address)
+        ["--wayland", "--dbus", "--", "/bin/sh", "-c", unlines
+         ["set -eu", "test -S /run/workcell-session-bus",
+          "test -S \"$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY\"",
+          "printf '%s\\n' \"$DBUS_SESSION_BUS_ADDRESS\" \"$GDK_BACKEND\""]]
+      lines out `shouldBe` ["unix:path=/run/workcell-session-bus", "wayland"]
+      overridden <- successful =<< invoke ctx Nothing (Just $ supplied address)
+        ["--dbus", "-e", "DBUS_SESSION_BUS_ADDRESS=unix:path=/custom", "--", "/bin/sh", "-c",
+         "echo \"$DBUS_SESSION_BUS_ADDRESS\""]
+      overridden `shouldBe` "unix:path=/custom\n"
+
+  it "rejects missing, unsupported, or malformed D-Bus session addresses" $ \ctx -> do
+    environment <- filter ((/= "DBUS_SESSION_BUS_ADDRESS") . fst) <$> getEnvironment
+    let check settings message = do
+          (code, _, err) <- invoke ctx Nothing (Just $ setVariables settings environment)
+            ["--dbus", "--dryrun"]
+          code `shouldNotBe` ExitSuccess
+          err `shouldContain` message
+    check [] "--dbus requires DBUS_SESSION_BUS_ADDRESS"
+    forM_ ["", "autolaunch:", "tcp:host=localhost,port=1234", "unix:abstract=bus",
+           "unix:path=/tmp/bus;unix:path=/tmp/other", "unix:path=/tmp/a,path=/tmp/b",
+           "unix:path=/tmp/bus,abstract=bus", "unix:path=/tmp/bus,invalid"] $ \value ->
+      check [("DBUS_SESSION_BUS_ADDRESS", value)] "single unix:path="
+    forM_ ["%", "%2", "%GG"] $ \escaped ->
+      check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/" ++ escaped)] "invalid escape"
+    check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/%00bus")] "NUL byte"
+    check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=relative")] "absolute Unix socket path"
+    check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/unescaped space")] "unescaped character"
+    check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp")] "not a socket"
 
   it "forwards arguments without interpreting options or shell syntax" $ \ctx -> do
     let args = ["--home", "-p", "", "a b", "'", "$HOME", "`uname`", "line\nbreak"]

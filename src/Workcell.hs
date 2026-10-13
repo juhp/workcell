@@ -4,9 +4,12 @@ module Workcell (Options(..), runWorkcell) where
 import Control.Exception (bracket, throwTo)
 import Control.Concurrent (myThreadId)
 import Control.Monad (forM, unless, void, when)
-import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
+import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
+import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import GHC.Foreign (peekCString)
+import GHC.IO.Encoding (getFileSystemEncoding)
 import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork)
 import SimpleCmd (cmdFull, needProgram)
 import Session (SessionDetails(..), withSession, listSessions, enterSession)
@@ -28,6 +31,7 @@ data Options = Options
   , environmentOptions :: [String]
   , waylandOption :: Bool
   , x11Option :: Bool
+  , dbusOption :: Bool
   , dryRun :: Bool
   , shareProcesses :: Bool
   , shareFilesystem :: Bool
@@ -60,7 +64,7 @@ runWorkcell opts
         invalid "--list and --enter cannot be combined"
       when (isJust (projectOption opts) || isJust (homeOption opts) ||
             not (null $ volumeOptions opts) || not (null $ environmentOptions opts) ||
-            waylandOption opts || x11Option opts || shareProcesses opts || shareFilesystem opts ||
+            waylandOption opts || x11Option opts || dbusOption opts || shareProcesses opts || shareFilesystem opts ||
             isJust (networkOption opts) || shareNetwork opts) $
         invalid "session operations cannot be combined with launch options"
       if listOption opts
@@ -143,11 +147,13 @@ prepare opts = do
   suppliedHome <- traverse resolveHome (homeOption opts)
   displaySettings <- sequence $
     [waylandSetup | waylandOption opts] ++ [x11Setup home | x11Option opts]
-  let displayMounts = concatMap fst displaySettings
+  busSettings <- sequence [dbusSetup | dbusOption opts]
+  let desktopSettings = displaySettings ++ busSettings
+      desktopMounts = concatMap fst desktopSettings
       backends = ["wayland" | waylandOption opts] ++ ["x11" | x11Option opts]
-      displayEnv = concatMap snd displaySettings ++
+      desktopEnv = concatMap snd desktopSettings ++
         [("GDK_BACKEND", intercalate "," backends) | not (null backends)]
-  mounts <- (displayMounts ++) <$> mapM resolveMount (volumeOptions opts)
+  mounts <- (desktopMounts ++) <$> mapM resolveMount (volumeOptions opts)
   unless (shareProcesses opts) $ do
     when (maybe False (within "/proc") project || within home "/proc" || within "/proc" home) $
       invalid "home and project must not overlap private /proc"
@@ -204,7 +210,7 @@ prepare opts = do
         ++ concatMap mountArgs mounts
         ++ maybe [] (\path -> ["--bind", path, path]) project
         ++ ["--chdir", fromMaybe home project, "--clearenv"]
-        ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ displayEnv ++ env)
+        ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ desktopEnv ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
         ++ ["--"] ++ cmd
       copies = [(length beforeSystemFiles + index * 3 + 1, path) |
@@ -248,6 +254,43 @@ x11Setup home = do
         [("DISPLAY", display), ("XAUTHORITY", authTarget)])
   where
     badDisplay = invalid "--x11 requires a local DISPLAY such as :0 or :0.0 (TCP displays are unsupported)"
+
+dbusSetup :: IO ([Mount], [(String, String)])
+dbusSetup = do
+  address <- lookupEnv "DBUS_SESSION_BUS_ADDRESS" >>= maybe
+    (invalid "--dbus requires DBUS_SESSION_BUS_ADDRESS") pure
+  value <- case break (== ':') address of
+    ("unix", parameters) | ';' `notElem` address ->
+      case map (break (== '=')) $ splitComma $ drop 1 parameters of
+        fields | all (\(key, val) -> key `elem` ["path", "guid"] && not (null $ drop 1 val)) fields,
+                 [path] <- [path | ("path", '=':path) <- fields] -> pure path
+        _ -> badAddress
+    _ -> badAddress
+  bytes <- either invalid pure $ unescape value
+  -- D-Bus escapes bytes; decode using the same encoding as filesystem paths.
+  encoding <- getFileSystemEncoding
+  socket <- BS.useAsCString (BS.pack bytes) $ peekCString encoding
+  unless (isAbsolute socket) $ invalid "--dbus requires an absolute Unix socket path"
+  status <- getFileStatus socket
+  unless (isSocket status) $ invalid $ "D-Bus session address is not a socket: " ++ socket
+  src <- canonicalizePath socket
+  let target = "/run/workcell-session-bus"
+  pure ([Mount src target False], [("DBUS_SESSION_BUS_ADDRESS", "unix:path=" ++ target)])
+  where
+    badAddress = invalid "--dbus requires a single unix:path= session address (abstract and TCP sockets are unsupported)"
+    splitComma input = case break (== ',') input of
+      (part, []) -> [part]
+      (part, _:rest) -> part : splitComma rest
+    unescape [] = Right []
+    unescape ('%':a:b:rest) | isHexDigit a && isHexDigit b = do
+      let byte = digitToInt a * 16 + digitToInt b
+      if byte == 0 then Left "D-Bus socket path contains a NUL byte"
+      else (fromIntegral byte :) <$> unescape rest
+    unescape ('%':_) = Left "invalid escape in D-Bus socket path"
+    unescape (c:rest)
+      | isAsciiLower c || isAsciiUpper c || c `elem` ['0'..'9'] || c `elem` "-_/.*\\" =
+          (fromIntegral (ord c) :) <$> unescape rest
+      | otherwise = Left "unescaped character in D-Bus socket path"
 
 privateProcArgs :: [String]
 privateProcArgs = ["--unshare-pid", "--proc", "/proc"]
