@@ -141,11 +141,12 @@ prepare opts = do
     invalid "project must not cover HOME; select a project directory with --project"
   let project = if within candidate home then Nothing else Just candidate
   suppliedHome <- traverse resolveHome (homeOption opts)
-  when (waylandOption opts && x11Option opts) $ invalid "--wayland and --x11 cannot be combined"
-  (displayMounts, displayEnv) <-
-    if waylandOption opts then waylandSetup
-    else if x11Option opts then x11Setup home
-    else pure ([], [])
+  displaySettings <- sequence $
+    [waylandSetup | waylandOption opts] ++ [x11Setup home | x11Option opts]
+  let displayMounts = concatMap fst displaySettings
+      backends = ["wayland" | waylandOption opts] ++ ["x11" | x11Option opts]
+      displayEnv = concatMap snd displaySettings ++
+        [("GDK_BACKEND", intercalate "," backends) | not (null backends)]
   mounts <- (displayMounts ++) <$> mapM resolveMount (volumeOptions opts)
   unless (shareProcesses opts) $ do
     when (maybe False (within "/proc") project || within home "/proc" || within "/proc" home) $
@@ -222,7 +223,7 @@ waylandSetup = do
   unless (isSocket status) $ invalid $ "Wayland display is not a socket: " ++ socket
   src <- canonicalizePath socket
   pure ([Mount src socket False],
-        [("XDG_RUNTIME_DIR", runtime), ("WAYLAND_DISPLAY", display), ("GDK_BACKEND", "wayland")])
+        [("XDG_RUNTIME_DIR", runtime), ("WAYLAND_DISPLAY", display)])
 
 x11Setup :: FilePath -> IO ([Mount], [(String, String)])
 x11Setup home = do
@@ -244,7 +245,7 @@ x11Setup home = do
   authStatus <- getFileStatus authority
   unless (isRegularFile authStatus) $ invalid $ "X11 authority is not a regular file: " ++ authority
   pure ([Mount socket socket False, Mount authority authTarget False],
-        [("DISPLAY", display), ("XAUTHORITY", authTarget), ("GDK_BACKEND", "x11")])
+        [("DISPLAY", display), ("XAUTHORITY", authTarget)])
   where
     badDisplay = invalid "--x11 requires a local DISPLAY such as :0 or :0.0 (TCP displays are unsupported)"
 

@@ -694,6 +694,20 @@ spec = describe "workcell CLI" $ do
         (setVariables [("DISPLAY", ":42"), ("XAUTHORITY", authority)] supplied)
         ["--x11", "-e", "GDK_BACKEND=custom", "--", "/bin/sh", "-c", "echo \"$GDK_BACKEND\""]
       out `shouldBe` "custom\n"
+      bracket (Net.socket Net.AF_UNIX Net.Stream Net.defaultProtocol) Net.close $ \wayland -> do
+        Net.bind wayland $ Net.SockAddrUnix $ directory </> "wayland-0"
+        let bothEnv = setVariables [("DISPLAY", ":42"),
+              ("WAYLAND_DISPLAY", "/tmp/.X11-unix/wayland-0")] supplied
+        forM_ [(["--wayland", "--x11"], "wayland,x11"),
+               (["--x11", "--wayland"], "wayland,x11"),
+               (["--wayland", "--x11", "-e", "GDK_BACKEND=x11,wayland"], "x11,wayland")] $ \(flags, backend) -> do
+          combined <- successful =<< run bothEnv (flags ++
+            ["--", "/bin/sh", "-c", unlines
+             ["set -eu", "test -S /tmp/.X11-unix/X42", "test -S \"$WAYLAND_DISPLAY\"",
+              "test ! -e /tmp/.X11-unix/private-marker",
+              "test \"$(cat \"$XAUTHORITY\")\" = test-cookie",
+              "printf '%s\\n' \"$DISPLAY\" \"$WAYLAND_DISPLAY\" \"$GDK_BACKEND\""]])
+          lines combined `shouldBe` [":42", "/tmp/.X11-unix/wayland-0", backend]
       (code, _, err) <- run
         (setVariables [("DISPLAY", ":42"), ("XAUTHORITY", directory)] supplied)
         ["--x11", "--dryrun"]
@@ -701,7 +715,7 @@ spec = describe "workcell CLI" $ do
       err `shouldContain` "X11 authority is not a regular file"
     readFile authority `shouldReturn` "test-cookie"
 
-  it "rejects missing, remote, malformed, or conflicting X11 settings before launch" $ \ctx -> do
+  it "rejects missing, remote, or malformed X11 settings before launch" $ \ctx -> do
     environment <- filter ((/= "DISPLAY") . fst) <$> getEnvironment
     let check settings args message = do
           (code, _, err) <- invoke ctx Nothing (Just $ setVariables settings environment)
@@ -711,7 +725,6 @@ spec = describe "workcell CLI" $ do
     check [] [] "--x11 requires DISPLAY"
     forM_ ["", "localhost:10.0", "host:0", ":", ":0.", ":0.bad", ":0.1.2", ":-1"] $ \display ->
       check [("DISPLAY", display)] [] "--x11 requires a local DISPLAY"
-    check [] ["--wayland"] "--wayland and --x11 cannot be combined"
 
   it "forwards arguments without interpreting options or shell syntax" $ \ctx -> do
     let args = ["--home", "-p", "", "a b", "'", "$HOME", "`uname`", "line\nbreak"]

@@ -127,7 +127,10 @@ file from `$XAUTHORITY` (or `~/.Xauthority` when unset) read-only at
 `GDK_BACKEND=x11`; explicit `-e` settings override these defaults.
 The socket and authority file must exist. TCP displays, including SSH-forwarded
 displays such as `localhost:10.0`, are unsupported by this option.
-`--x11` and `--wayland` cannot be combined.
+Combine `--wayland --x11` to expose both displays. This sets
+`GDK_BACKEND=wayland,x11`, letting GTK try Wayland first and fall back to X11.
+The order of the flags does not affect this preference; use `-e GDK_BACKEND=...`
+to choose another order or backend.
 
 ```sh
 workcell --x11 -- xterm
