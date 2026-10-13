@@ -289,14 +289,3 @@ including process startup and cleanup. Both use `--network host` so pasta is not
 required. The live benchmark is skipped with a diagnostic if sandbox startup is
 unavailable. Cabal supplies the built executable; set `WORKCELL` to an absolute
 path to benchmark another binary.
-
-The original shell prototype is also available:
-
-```sh
-./bwrap.sh                       # current project, interactive Bash
-./bwrap.sh /path/to/project      # another project
-./bwrap.sh . ghc --version       # run a command
-```
-
-The shell prototype uses the fixed temporary home `/home/workcell` and has no
-extra volume or environment options.
