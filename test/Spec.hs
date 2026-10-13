@@ -126,7 +126,7 @@ spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
   it "lists no sessions and rejects conflicting session options without launching" $ \ctx -> do
     sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
-    forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"],
+    forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"], ["--list", "--wayland"],
            ["--list", "--", "/bin/true"], ["--enter", "s123", "-H", "unwanted"]] $ \args -> do
       (code, _, _) <- sessionInvoke ctx args
       code `shouldNotBe` ExitSuccess
@@ -624,6 +624,40 @@ spec = describe "workcell CLI" $ do
         "[ \"$WORKCELL_TEST_VALUE\" = last=part ]", "[ \"${WORKCELL_TEST_EMPTY+x}\" = x ]",
         "[ -z \"$WORKCELL_TEST_EMPTY\" ]"]]
     pure ()
+
+  it "exposes only the Wayland socket and permits explicit environment overrides" $ \ctx -> do
+    environment <- getEnvironment
+    let runtime = root ctx </> "wayland-runtime"
+        socket = runtime </> "wayland-0"
+        supplied display = setVariables ([("XDG_RUNTIME_DIR", runtime)] ++
+          [("WAYLAND_DISPLAY", value) | Just value <- [display]]) $
+          filter ((/= "WAYLAND_DISPLAY") . fst) environment
+    createDirectory runtime
+    writeFile (runtime </> "private-marker") "hidden"
+    bracket (Net.socket Net.AF_UNIX Net.Stream Net.defaultProtocol) Net.close $ \listener -> do
+      Net.bind listener $ Net.SockAddrUnix socket
+      forM_ [Nothing, Just "wayland-0", Just socket] $ \display -> do
+        out <- successful =<< invoke ctx Nothing (Just $ supplied display)
+          ["--wayland", "--", "/bin/sh", "-c",
+           "test -S \"$1\" && test ! -e \"$XDG_RUNTIME_DIR/private-marker\" && printf '%s\\n' \"$XDG_RUNTIME_DIR\" \"$WAYLAND_DISPLAY\" \"$GDK_BACKEND\"",
+           "check", socket]
+        lines out `shouldBe` [runtime, fromMaybe "wayland-0" display, "wayland"]
+      out <- successful =<< invoke ctx Nothing (Just $ supplied Nothing)
+        ["--wayland", "-e", "GDK_BACKEND=x11", "--", "/bin/sh", "-c", "echo \"$GDK_BACKEND\""]
+      out `shouldBe` "x11\n"
+
+  it "rejects missing or invalid Wayland settings before launch" $ \ctx -> do
+    environment <- filter (\(key, _) -> key `notElem` ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"]) <$> getEnvironment
+    let check settings message = do
+          (code, _, err) <- invoke ctx Nothing (Just $ setVariables settings environment)
+            ["--wayland", "--dryrun"]
+          code `shouldNotBe` ExitSuccess
+          err `shouldContain` message
+    check [] "--wayland requires XDG_RUNTIME_DIR"
+    check [("XDG_RUNTIME_DIR", "relative")] "absolute XDG_RUNTIME_DIR"
+    check [("XDG_RUNTIME_DIR", root ctx), ("WAYLAND_DISPLAY", "")] "nonempty WAYLAND_DISPLAY"
+    check [("XDG_RUNTIME_DIR", root ctx), ("WAYLAND_DISPLAY", root ctx)] "not a socket"
+    check [("XDG_RUNTIME_DIR", root ctx)] "wayland-0"
 
   it "forwards arguments without interpreting options or shell syntax" $ \ctx -> do
     let args = ["--home", "-p", "", "a b", "'", "$HOME", "`uname`", "line\nbreak"]

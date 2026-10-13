@@ -1,4 +1,6 @@
-# workcell
+WIP
+
+# workcell notes
 
 Run installed system tools with a read-only filesystem, an isolated home,
 and a writable project. Requires Linux and bubblewrap, plus pasta (from the
@@ -105,8 +107,22 @@ a persistent home or an explicit mount (for example, `-v ~/.local/bin` or
 `-v ~/bin`); the default home is empty. Tools in other locations need a supplied
 `PATH`.
 
-Use `WORKCELL_ACTIVE` to detect workcell in your shell configuration. For example,
-add this after setting `PS1` in the `.bashrc` used by your workcell home:
+`--wayland` exposes the individual Wayland display socket and sets
+`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, and `GDK_BACKEND=wayland` for graphical
+applications. It requires an absolute `XDG_RUNTIME_DIR` and an existing socket.
+If `WAYLAND_DISPLAY` is unset, it uses `wayland-0`; absolute display paths are
+also supported. Explicit `-e` settings override these defaults.
+
+```sh
+workcell --wayland -- gtk4-demo
+```
+
+Audio, GPU devices, and the desktop D-Bus session are not exposed yet
+by this option.
+
+Use `WORKCELL_ACTIVE` to detect workcell in your shell configuration.
+For example, add this after setting `PS1` in the `.bashrc` used by
+your workcell home:
 
 ```bash
 if [[ ${WORKCELL_ACTIVE:-} == 1 ]]; then
