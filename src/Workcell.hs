@@ -18,7 +18,7 @@ import System.Exit (ExitCode(..), exitWith)
 import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.IO.Error (catchIOError, isDoesNotExistError)
-import System.Posix.Files (getFileStatus, isSocket, linkCount)
+import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
 import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
 
 data Options = Options
@@ -27,6 +27,7 @@ data Options = Options
   , volumeOptions :: [String]
   , environmentOptions :: [String]
   , waylandOption :: Bool
+  , x11Option :: Bool
   , dryRun :: Bool
   , shareProcesses :: Bool
   , shareFilesystem :: Bool
@@ -59,7 +60,8 @@ runWorkcell opts
         invalid "--list and --enter cannot be combined"
       when (isJust (projectOption opts) || isJust (homeOption opts) ||
             not (null $ volumeOptions opts) || not (null $ environmentOptions opts) ||
-            waylandOption opts || shareProcesses opts || shareFilesystem opts || isJust (networkOption opts) || shareNetwork opts) $
+            waylandOption opts || x11Option opts || shareProcesses opts || shareFilesystem opts ||
+            isJust (networkOption opts) || shareNetwork opts) $
         invalid "session operations cannot be combined with launch options"
       if listOption opts
         then do
@@ -139,7 +141,11 @@ prepare opts = do
     invalid "project must not cover HOME; select a project directory with --project"
   let project = if within candidate home then Nothing else Just candidate
   suppliedHome <- traverse resolveHome (homeOption opts)
-  (displayMounts, displayEnv) <- if waylandOption opts then waylandSetup else pure ([], [])
+  when (waylandOption opts && x11Option opts) $ invalid "--wayland and --x11 cannot be combined"
+  (displayMounts, displayEnv) <-
+    if waylandOption opts then waylandSetup
+    else if x11Option opts then x11Setup home
+    else pure ([], [])
   mounts <- (displayMounts ++) <$> mapM resolveMount (volumeOptions opts)
   unless (shareProcesses opts) $ do
     when (maybe False (within "/proc") project || within home "/proc" || within "/proc" home) $
@@ -217,6 +223,30 @@ waylandSetup = do
   src <- canonicalizePath socket
   pure ([Mount src socket False],
         [("XDG_RUNTIME_DIR", runtime), ("WAYLAND_DISPLAY", display), ("GDK_BACKEND", "wayland")])
+
+x11Setup :: FilePath -> IO ([Mount], [(String, String)])
+x11Setup home = do
+  display <- lookupEnv "DISPLAY" >>= maybe (invalid "--x11 requires DISPLAY") pure
+  number <- case break (== ':') display of
+    (host, ':':suffix) | host `elem` ["", "unix", "unix/"] ->
+      case span isDigit suffix of
+        (digits, screen) | not (null digits) &&
+          (null screen || case screen of
+            '.':rest -> not (null rest) && all isDigit rest
+            _ -> False) -> pure digits
+        _ -> badDisplay
+    _ -> badDisplay
+  let socket = "/tmp/.X11-unix" </> ("X" ++ number)
+      authTarget = "/run/workcell-xauthority"
+  status <- getFileStatus socket
+  unless (isSocket status) $ invalid $ "X11 display is not a socket: " ++ socket
+  authority <- lookupEnv "XAUTHORITY" >>= canonicalizePath . fromMaybe (home </> ".Xauthority")
+  authStatus <- getFileStatus authority
+  unless (isRegularFile authStatus) $ invalid $ "X11 authority is not a regular file: " ++ authority
+  pure ([Mount socket socket False, Mount authority authTarget False],
+        [("DISPLAY", display), ("XAUTHORITY", authTarget), ("GDK_BACKEND", "x11")])
+  where
+    badDisplay = invalid "--x11 requires a local DISPLAY such as :0 or :0.0 (TCP displays are unsupported)"
 
 privateProcArgs :: [String]
 privateProcArgs = ["--unshare-pid", "--proc", "/proc"]

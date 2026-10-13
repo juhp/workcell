@@ -126,7 +126,8 @@ spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
   it "lists no sessions and rejects conflicting session options without launching" $ \ctx -> do
     sessionInvoke ctx ["--list"] >>= successful >>= (`shouldBe` "")
-    forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"], ["--list", "--wayland"],
+    forM_ [["--list", "--enter", "s123"], ["--list", "--share-network"],
+           ["--list", "--wayland"], ["--list", "--x11"],
            ["--list", "--", "/bin/true"], ["--enter", "s123", "-H", "unwanted"]] $ \args -> do
       (code, _, _) <- sessionInvoke ctx args
       code `shouldNotBe` ExitSuccess
@@ -658,6 +659,59 @@ spec = describe "workcell CLI" $ do
     check [("XDG_RUNTIME_DIR", root ctx), ("WAYLAND_DISPLAY", "")] "nonempty WAYLAND_DISPLAY"
     check [("XDG_RUNTIME_DIR", root ctx), ("WAYLAND_DISPLAY", root ctx)] "not a socket"
     check [("XDG_RUNTIME_DIR", root ctx)] "wayland-0"
+
+  it "exposes the selected X11 socket and read-only authority with environment overrides" $ \ctx -> do
+    environment <- getEnvironment
+    let directory = root ctx </> "x11"
+        authority = root ctx </> ".Xauthority"
+        -- Exercise an inherited TMPDIR that becomes read-only in the fixture.
+        supplied = setVariables [("HOME", root ctx), ("TMPDIR", root ctx)] $
+          filter ((/= "XAUTHORITY") . fst) environment
+        run envs args = capture $ (proc "bwrap" $
+          ["--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/tmp",
+           "--bind", "/proc", "/proc",
+           "--ro-bind", directory, "/tmp/.X11-unix",
+           "--setenv", "TMPDIR", "/tmp",
+           "--setenv", "XDG_RUNTIME_DIR", "/tmp/workcell-x11-runtime",
+           "--", binary ctx, "--network", "host"] ++
+          ["--share-processes" | not $ privateProc ctx] ++ args)
+          {cwd = Just $ project ctx, env = Just envs}
+    createDirectory directory
+    writeFile authority "test-cookie"
+    writeFile (directory </> "private-marker") "hidden"
+    bracket (Net.socket Net.AF_UNIX Net.Stream Net.defaultProtocol) Net.close $ \listener -> do
+      Net.bind listener $ Net.SockAddrUnix $ directory </> "X42"
+      forM_ [":42", ":42.0", "unix:42", "unix/:42.1"] $ \display -> do
+        out <- successful =<< run (setVariables [("DISPLAY", display)] supplied)
+          ["--x11", "--", "/bin/sh", "-c", unlines
+           ["set -eu", "test -S /tmp/.X11-unix/X42",
+            "test ! -e /tmp/.X11-unix/private-marker",
+            "test \"$(cat \"$XAUTHORITY\")\" = test-cookie",
+            "! printf changed > \"$XAUTHORITY\"",
+            "printf '%s\\n' \"$DISPLAY\" \"$XAUTHORITY\" \"$GDK_BACKEND\""]]
+        lines out `shouldBe` [display, "/run/workcell-xauthority", "x11"]
+      out <- successful =<< run
+        (setVariables [("DISPLAY", ":42"), ("XAUTHORITY", authority)] supplied)
+        ["--x11", "-e", "GDK_BACKEND=custom", "--", "/bin/sh", "-c", "echo \"$GDK_BACKEND\""]
+      out `shouldBe` "custom\n"
+      (code, _, err) <- run
+        (setVariables [("DISPLAY", ":42"), ("XAUTHORITY", directory)] supplied)
+        ["--x11", "--dryrun"]
+      code `shouldNotBe` ExitSuccess
+      err `shouldContain` "X11 authority is not a regular file"
+    readFile authority `shouldReturn` "test-cookie"
+
+  it "rejects missing, remote, malformed, or conflicting X11 settings before launch" $ \ctx -> do
+    environment <- filter ((/= "DISPLAY") . fst) <$> getEnvironment
+    let check settings args message = do
+          (code, _, err) <- invoke ctx Nothing (Just $ setVariables settings environment)
+            (["--x11", "--dryrun"] ++ args)
+          code `shouldNotBe` ExitSuccess
+          err `shouldContain` message
+    check [] [] "--x11 requires DISPLAY"
+    forM_ ["", "localhost:10.0", "host:0", ":", ":0.", ":0.bad", ":0.1.2", ":-1"] $ \display ->
+      check [("DISPLAY", display)] [] "--x11 requires a local DISPLAY"
+    check [] ["--wayland"] "--wayland and --x11 cannot be combined"
 
   it "forwards arguments without interpreting options or shell syntax" $ \ctx -> do
     let args = ["--home", "-p", "", "a b", "'", "$HOME", "`uname`", "line\nbreak"]

@@ -24,6 +24,7 @@ options = Options
   <*> many (strOptionWith 'v' "volume" "SOURCE[:DEST][:ro|rw]" "Extra mount (default: same path, read-only)")
   <*> many (strOptionWith 'e' "env" "KEY[=VALUE]" "Set or pass through an environment variable")
   <*> switchLongWith "wayland" "Expose the Wayland display socket for graphical applications"
+  <*> switchLongWith "x11" "Expose the local X11 display socket and authentication file"
   <*> switchLongWith "dryrun" "Print the bubblewrap command without changing files"
   <*> switchLongWith "share-processes" "Share enclosing processes and /proc instead of isolating them"
   <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"

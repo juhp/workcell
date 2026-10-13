@@ -120,6 +120,22 @@ workcell --wayland -- gtk4-demo
 Audio, GPU devices, and the desktop D-Bus session are not exposed yet
 by this option.
 
+`--x11` supports local X11 and Xwayland displays such as `:0` or `:0.0`.
+It exposes only the selected `/tmp/.X11-unix/XN` socket and mounts the authority
+file from `$XAUTHORITY` (or `~/.Xauthority` when unset) read-only at
+`/run/workcell-xauthority`. It sets `DISPLAY`, `XAUTHORITY`, and
+`GDK_BACKEND=x11`; explicit `-e` settings override these defaults.
+The socket and authority file must exist. TCP displays, including SSH-forwarded
+displays such as `localhost:10.0`, are unsupported by this option.
+`--x11` and `--wayland` cannot be combined.
+
+```sh
+workcell --x11 -- xterm
+```
+
+X11 access permits broad interaction with other X clients, including input and
+clipboard access. Audio, GPU devices, and desktop D-Bus remain separate.
+
 Use `WORKCELL_ACTIVE` to detect workcell in your shell configuration.
 For example, add this after setting `PS1` in the `.bashrc` used by
 your workcell home:
