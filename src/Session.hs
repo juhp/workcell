@@ -19,20 +19,21 @@ import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import GHC.Generics (Generic)
 import SimpleCmd (needProgram)
-import Network (withChild)
 import System.Directory
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), isAbsolute, takeFileName)
 import System.IO (hClose, hIsTerminalDevice, openBinaryTempFile, stdin, stdout)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files
-import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
+import System.Posix.IO (OpenMode(..), closeFd)
 import System.Posix.Process (getProcessID)
 import System.Process (CreateProcess(..), proc, waitForProcess)
 import System.Exit (exitWith)
 import System.Posix.Types (Fd(..))
 import System.Posix.User (getEffectiveUserID)
 import System.Timeout (timeout)
+
+import Network (withChild, openSimpleFd)
 
 data SessionDetails = SessionDetails
   { sessionProject :: Maybe FilePath
@@ -239,7 +240,9 @@ enterSession ident dry command = do
     [found] -> pure found
     _ -> invalid $ "unknown or expired session " ++ ident ++ " in this PID namespace (use --list)"
   interactive <- (&&) <$> hIsTerminalDevice stdin <*> hIsTerminalDevice stdout
-  entryCommand <- if interactive then terminalCommand cmd else pure cmd
+  entryCommand <-
+    let cmd = if null command then ["/bin/bash"] else command in
+      if interactive then terminalCommand cmd else pure cmd
   let pid = sessionPID record
       details = sessionDetails record
       namespaces = ["mnt"] ++ ["pid" | not $ sessionSharedProcesses details] ++
@@ -273,7 +276,6 @@ enterSession ident dry command = do
             exitWith result
         _ -> invalid "missing mount namespace descriptor"
   where
-    cmd = if null command then ["/bin/bash"] else command
 
 -- The caller's terminal belongs to another devpts instance. Allocate the new
 -- terminal after nsenter has joined the session, and relay input/output to it.

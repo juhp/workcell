@@ -1,9 +1,19 @@
-{-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
 -- SPDX-License-Identifier: BSD-3-Clause
 module Network
-  (NetworkMode(..), networkMode, pastaArguments, verifyNetwork, runPrivateNetwork, runTrackedPrivateNetwork, runTrackedSandbox, withChild) where
+  (NetworkMode(..),
+   networkMode,
+   pastaArguments,
+   verifyNetwork,
+   runPrivateNetwork,
+   runTrackedPrivateNetwork,
+   runTrackedSandbox,
+   withChild,
+   openSimpleFd)
+where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket, evaluate)
@@ -166,7 +176,7 @@ runTrackedSandbox track args = do
         (mounts, command) = break (== "--") args
         script = "if IFS= read -r ready < \"$1\" && [ \"$ready\" = ready ]; then shift; exec \"$@\"; fi; exit 1"
     createNamedPipe ready 0o600
-    bracket (openFd ready ReadWrite defaultFileFlags) closeFd $ \gate ->
+    bracket (openSimpleFd ready ReadWrite) closeFd $ \gate ->
       withPipe $ \(_, output, reader, writer) -> do
         let argv = ["--info-fd", show output] ++ mounts ++
               ["--ro-bind", ready, inside, "--", "/bin/sh", "-c", script,
@@ -187,7 +197,7 @@ runNetwork track logHandle extraPastaArgs args resolverDestination = do
     let readyPipe = dir </> "ready"
         sandboxPipe = "/run/workcell-network-ready"
     createNamedPipe readyPipe 0o600
-    bracket (openFd readyPipe ReadWrite defaultFileFlags) closeFd $ \gate ->
+    bracket (openSimpleFd readyPipe ReadWrite) closeFd $ \gate ->
       withResolver tmp $ \resolverFd ->
       withPipe $ \(_, infoWrite, infoHandle, infoOutput) -> do
         let setup = ["--info-fd", show infoWrite]
@@ -206,7 +216,7 @@ runNetwork track logHandle extraPastaArgs args resolverDestination = do
           SandboxInfo pid <- either (invalid . ("invalid bubblewrap namespace info: " ++)) pure $
             eitherDecodeStrict' info
           let childNet = "/proc" </> show pid </> "ns/net"
-          bracket (openFd childNet ReadOnly defaultFileFlags) closeFd $ \netFd ->
+          bracket (openSimpleFd childNet ReadOnly) closeFd $ \netFd ->
             bracket (ownerNamespace netFd) closeFd $ \userFd -> do
               supervisor <- getProcessID
               let reference fd = "/proc" </> show supervisor </> "fd" </> show fd
@@ -308,3 +318,11 @@ ignoreMissing action = catchIOError action $ \err ->
 
 invalid :: String -> IO a
 invalid = ioError . userError
+
+-- taken from shake General.FileLock
+openSimpleFd :: FilePath -> OpenMode -> IO Fd
+#if MIN_VERSION_unix(2,8,0)
+openSimpleFd file mode = openFd file mode defaultFileFlags
+#else
+openSimpleFd file mode = openFd file mode Nothing defaultFileFlags
+#endif

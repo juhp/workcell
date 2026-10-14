@@ -10,9 +10,7 @@ import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
-import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork)
 import SimpleCmd (cmdFull, needProgram)
-import Session (SessionDetails(..), withSession, listSessions, enterSession)
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
@@ -22,7 +20,10 @@ import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
-import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
+import System.Posix.IO (OpenMode(..), closeFd)
+
+import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork, openSimpleFd)
+import Session (SessionDetails(..), withSession, listSessions, enterSession)
 
 data Options = Options
   { projectOption :: Maybe FilePath
@@ -129,7 +130,7 @@ launchWorkcell opts = do
 withSystemFiles :: [(Int, FilePath)] -> ([(Int, String)] -> IO a) -> IO a
 withSystemFiles [] action = action []
 withSystemFiles ((index, path):rest) action =
-  bracket (openFd path ReadOnly defaultFileFlags) closeFd $ \fd ->
+  bracket (openSimpleFd path ReadOnly) closeFd $ \fd ->
     withSystemFiles rest $ \descriptors -> action ((index, show fd) : descriptors)
 
 -- Validate paths and construct argv before creating any persistent home.

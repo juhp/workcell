@@ -900,7 +900,7 @@ spec = describe "workcell CLI" $ do
     BS.writeFile replacement replaced
     forM_ ("host" : ["none" | privateNet ctx]) $ \mode ->
       forM_ [False, True] $ \override ->
-      bracket (Posix.openFd fixture Posix.ReadOnly Posix.defaultFileFlags) Posix.closeFd $ \fd -> do
+      bracket (WorkcellNetwork.openSimpleFd fixture Posix.ReadOnly) Posix.closeFd $ \fd -> do
         let outer = ["--ro-bind", "/", "/", "--proc", "/proc",
                      "--bind", project ctx, project ctx, "--ro-bind", sparseEtc, "/etc",
                      "--tmpfs", "/run", "--ro-bind-data", show fd, "/run/host/etc/localtime",
