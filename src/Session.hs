@@ -23,7 +23,7 @@ import Network (withChild)
 import System.Directory
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), isAbsolute, takeFileName)
-import System.IO (hClose, openBinaryTempFile)
+import System.IO (hClose, hIsTerminalDevice, openBinaryTempFile, stdin, stdout)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files
 import System.Posix.IO (OpenMode(..), closeFd, defaultFileFlags, openFd)
@@ -238,9 +238,10 @@ enterSession ident dry command = do
   record <- case matches of
     [found] -> pure found
     _ -> invalid $ "unknown or expired session " ++ ident ++ " in this PID namespace (use --list)"
+  interactive <- (&&) <$> hIsTerminalDevice stdin <*> hIsTerminalDevice stdout
+  entryCommand <- if interactive then terminalCommand cmd else pure cmd
   let pid = sessionPID record
       details = sessionDetails record
-      cmd = if null command then ["/bin/bash"] else command
       namespaces = ["mnt"] ++ ["pid" | not $ sessionSharedProcesses details] ++
         ["net" | sessionNetwork details /= "host"]
       flag "mnt" = "--mount"
@@ -249,7 +250,7 @@ enterSession ident dry command = do
   if dry then putStrLn $ unwords $ map quote $
     ["nsenter", "--user=" ++ procPath pid "ns/user", "--user-parent"] ++
     [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
-    tailArgs ++ ["--root", "--wd", "--"] ++ cmd
+    tailArgs ++ ["--root", "--wd", "--"] ++ entryCommand
   else do
     needProgram "nsenter"
     withDescriptors [procPath pid ("ns" </> name) | name <- namespaces] $ \fds ->
@@ -264,16 +265,32 @@ enterSession ident dry command = do
                 args = ["--user=" ++ reference owner] ++
                   zipWith (\name fd -> flag name ++ "=" ++ reference fd) namespaces fds ++
                   tailArgs ++ zipWith (\name fd -> name ++ "=" ++ reference fd)
-                    ["--root", "--wd"] directories ++ ["--"] ++ cmd
+                    ["--root", "--wd"] directories ++ ["--"] ++ entryCommand
             -- nsenter opens the supervisor's descriptors before joining. Its
             -- command inherits none of our namespace/root directory handles.
             result <- withChild ((proc "nsenter" args)
               {delegate_ctlc = True, close_fds = True}) waitForProcess
             exitWith result
         _ -> invalid "missing mount namespace descriptor"
+  where
+    cmd = if null command then ["/bin/bash"] else command
+
+-- The caller's terminal belongs to another devpts instance. Allocate the new
+-- terminal after nsenter has joined the session, and relay input/output to it.
+terminalCommand :: [String] -> IO [String]
+terminalCommand command = do
+  forward <- findExecutable "systemd-pty-forward"
+  case forward of
+    Just path -> pure $ [path, "--quiet", "--"] ++ command
+    Nothing -> do
+      script <- findExecutable "script"
+      case script of
+        Just path -> pure [path, "--quiet", "--return", "--command",
+                           "exec " ++ unwords (map quote command), "/dev/null"]
+        Nothing -> invalid "interactive entry requires systemd-pty-forward or script (from util-linux)"
 
 withDescriptors :: [FilePath] -> ([Fd] -> IO a) -> IO a
 withDescriptors [] action = action []
 withDescriptors (path:rest) action = bracket
-  (openFd path ReadOnly defaultFileFlags) closeFd $ \fd ->
-    withDescriptors rest $ \fds -> action (fd:fds)
+  (openSimpleFd path ReadOnly) closeFd $ \fd ->
+  withDescriptors rest $ \fds -> action (fd:fds)

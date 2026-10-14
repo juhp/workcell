@@ -18,10 +18,12 @@ import System.Directory hiding (executable)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..), die, exitWith)
 import System.FilePath ((</>), takeDirectory)
+import System.IO (hClose, hFlush, hGetLine, hPutStrLn)
 import System.Posix.Files (fileMode, getFileStatus, readSymbolicLink, setFileMode)
 import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
+import System.Posix.Terminal (openPseudoTerminal)
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
 import System.Posix.Signals (signalProcess, sigKILL)
 import System.Process hiding (shell)
@@ -163,6 +165,37 @@ spec = describe "workcell CLI" $ do
       lines out `shouldBe` ["1", "hello world", project ctx, "literal argument"]
       (code, _, _) <- sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c", "exit 23"]
       code `shouldBe` ExitFailure 23
+
+  it "enters with a usable terminal and preserves input, arguments, and exit status" $ \ctx -> do
+    helpers <- mapM findExecutable ["systemd-pty-forward", "script"]
+    when (all isNothing helpers) $ pendingWith "no terminal relay helper available"
+    withRunningSession ctx [] $ \ident -> do
+      environment <- sessionEnvironment ctx
+      let open = do
+            (master, slave) <- openPseudoTerminal
+            (,) <$> Posix.fdToHandle master <*> Posix.fdToHandle slave
+          close (master, slave) = hClose master >> hClose slave
+      bracket open close $ \(master, slave) -> do
+        let invocation = (proc (binary ctx)
+              ["--enter", ident, "--", "/bin/sh", "-c", unlines
+               ["set -eu", "test -t 0 && test -t 1 && test -t 2",
+                "device=$(tty); test -c \"$device\"",
+                "stty -F /dev/tty -a >/dev/null", "stty -echo", "printf 'ready\\n'",
+                "IFS= read -r answer", "test \"$answer\" = 'terminal input'",
+                "test \"$1\" = \"literal ' argument\"", "exit 23"],
+               "check", "literal ' argument"])
+              {env = Just environment, std_in = UseHandle slave,
+               std_out = UseHandle slave, std_err = UseHandle slave}
+        result <- timeout (5 * 1000000) $
+          bracket (createProcess invocation)
+            (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
+            \(_, _, _, handle) -> do
+              ready <- hGetLine master
+              ready `shouldBe` "ready\r"
+              hPutStrLn master "terminal input"
+              hFlush master
+              waitForProcess handle
+        result `shouldBe` Just (ExitFailure 23)
 
   it "ignores stale, mismatched, malformed and publicly readable session records" $ \ctx -> do
     withRunningSession ctx [] $ \ident -> do

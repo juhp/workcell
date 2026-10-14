@@ -47,6 +47,10 @@ additional command using the session's filesystem root, working directory,
 initial command environment, and isolated process/network namespaces. Shared
 process or network namespaces are left unchanged. Session operations cannot be
 combined with launch options such as `--home`, `--volume`, or `--network`.
+When both input and output are terminals, entry allocates a new terminal inside
+the session using `systemd-pty-forward` or `script` (from util-linux).
+This lets terminal applications and shell job control work with the session's
+private `/dev/pts`. Piped commands keep their usual input/output streams.
 
 Records are stored beneath `$XDG_RUNTIME_DIR/workcell/sessions/<pid-namespace-id>/`.
 When no absolute runtime directory is configured, workcell uses
