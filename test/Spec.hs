@@ -166,7 +166,27 @@ spec = describe "workcell CLI" $ do
       (code, _, _) <- sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c", "exit 23"]
       code `shouldBe` ExitFailure 23
 
+  it "enters as the original user in both private and shared process modes" $ \ctx -> do
+    uid <- getEffectiveUserID
+    gid <- getEffectiveGroupID
+    forM_ [[], ["--share-processes"]] $ \flags ->
+      withRunningSession ctx flags $ \ident -> do
+        paths <- sessionRecordPaths ctx
+        path <- case paths of
+          [found] -> pure found
+          _ -> fail "expected one session record"
+        record <- BS.readFile path >>= either fail pure . eitherDecodeStrict'
+        pid <- case record of
+          Object object | Just (Number number) <- KM.lookup "sessionPID" object -> pure (round number :: Int)
+          _ -> fail "session record has no PID"
+        namespace <- readSymbolicLink $ "/proc/" ++ show pid ++ "/ns/user"
+        out <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
+          "id -u; id -g; readlink /proc/self/ns/user"]
+        lines out `shouldBe` [show uid, show gid, namespace]
+
   it "enters with a usable terminal and preserves input, arguments, and exit status" $ \ctx -> do
+    uid <- getEffectiveUserID
+    gid <- getEffectiveGroupID
     helpers <- mapM findExecutable ["systemd-pty-forward", "script"]
     when (all isNothing helpers) $ pendingWith "no terminal relay helper available"
     withRunningSession ctx [] $ \ident -> do
@@ -182,8 +202,9 @@ spec = describe "workcell CLI" $ do
                 "device=$(tty); test -c \"$device\"",
                 "stty -F /dev/tty -a >/dev/null", "stty -echo", "printf 'ready\\n'",
                 "IFS= read -r answer", "test \"$answer\" = 'terminal input'",
-                "test \"$1\" = \"literal ' argument\"", "exit 23"],
-               "check", "literal ' argument"])
+                "test \"$1\" = \"literal ' argument\"",
+                "test \"$(id -u)\" = \"$2\"; test \"$(id -g)\" = \"$3\"", "exit 23"],
+               "check", "literal ' argument", show uid, show gid])
               {env = Just environment, std_in = UseHandle slave,
                std_out = UseHandle slave, std_err = UseHandle slave}
         result <- timeout (5 * 1000000) $

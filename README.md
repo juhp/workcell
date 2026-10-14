@@ -44,8 +44,11 @@ workcell --enter s123456 --dryrun
 
 Entry requires `nsenter` (from util-linux) and runs without sudo. It starts an
 additional command using the session's filesystem root, working directory,
-initial command environment, and isolated process/network namespaces. Shared
-process or network namespaces are left unchanged. Session operations cannot be
+initial command environment, and isolated process/network namespaces.
+Entry also joins the initial command's user namespace, preserving the invoking
+user's UID/GID rather than leaving the command as root in bubblewrap's setup
+namespace.
+Shared process or network namespaces are left unchanged. Session operations cannot be
 combined with launch options such as `--home`, `--volume`, or `--network`.
 When both input and output are terminals, entry allocates a new terminal inside
 the session using `systemd-pty-forward` or `script` (from util-linux).

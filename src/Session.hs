@@ -250,32 +250,45 @@ enterSession ident dry command = do
       flag "mnt" = "--mount"
       flag name = "--" ++ name
       tailArgs = ["--target", show pid, "--env", "--preserve-credentials"]
-  if dry then putStrLn $ unwords $ map quote $
-    ["nsenter", "--user=" ++ procPath pid "ns/user", "--user-parent"] ++
-    [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
-    tailArgs ++ ["--root", "--wd", "--"] ++ entryCommand
-  else do
-    needProgram "nsenter"
-    withDescriptors [procPath pid ("ns" </> name) | name <- namespaces] $ \fds ->
-      case fds of
-        mount:_ -> bracket (ownerNamespace mount) closeFd $ \owner ->
+  withDescriptors [procPath pid ("ns" </> name) | name <- namespaces] $ \fds ->
+    case fds of
+      mount:_ -> bracket (ownerNamespace mount) closeFd $ \owner -> do
+        supervisor <- getProcessID
+        let reference fd = "/proc/" ++ show supervisor ++ "/fd/" ++ show fd
+        ownerUser <- readSymbolicLink $ reference owner
+        targetUser <- readSymbolicLink $ procPath pid "ns/user"
+        -- Mount/network entry requires their owning user namespace. Bubblewrap
+        -- may then use a child user namespace to restore the invoking UID/GID.
+        -- Join that final namespace only after entering the other namespaces.
+        finalCommand <- if ownerUser == targetUser then pure entryCommand else do
+          insidePID <- if sessionSharedProcesses details then pure (show pid) else do
+            status <- lines <$> strictRead (procPath pid "status")
+            case [inside | line <- status, "NSpid:":ids <- [words line], inside:_ <- [reverse ids]] of
+              [inside] -> pure inside
+              _ -> invalid "cannot determine session PID inside its namespace"
+          nsenter <- findExecutable "nsenter" >>= maybe (invalid "nsenter is required for entry") pure
+          pure $ [nsenter, "--user=/proc/" ++ insidePID ++ "/ns/user", "--preserve-credentials", "--"] ++ entryCommand
+        if dry then putStrLn $ unwords $ map quote $
+          ["nsenter", "--user=" ++ procPath pid "ns/user"] ++
+          ["--user-parent" | ownerUser /= targetUser] ++
+          [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
+          tailArgs ++ ["--root", "--wd", "--"] ++ finalCommand
+        else do
+          needProgram "nsenter"
           withDescriptors [procPath pid "root", procPath pid "cwd"] $ \directories -> do
             valid <- validSession record
             unless valid $ invalid "session exited while preparing entry"
             -- Explicit descriptors avoid nsenter's mixed pidfd/FD join ordering.
-            supervisor <- getProcessID
-            let reference fd = "/proc/" ++ show supervisor ++ "/fd/" ++ show fd
-                args = ["--user=" ++ reference owner] ++
+            let args = ["--user=" ++ reference owner] ++
                   zipWith (\name fd -> flag name ++ "=" ++ reference fd) namespaces fds ++
                   tailArgs ++ zipWith (\name fd -> name ++ "=" ++ reference fd)
-                    ["--root", "--wd"] directories ++ ["--"] ++ entryCommand
+                    ["--root", "--wd"] directories ++ ["--"] ++ finalCommand
             -- nsenter opens the supervisor's descriptors before joining. Its
             -- command inherits none of our namespace/root directory handles.
             result <- withChild ((proc "nsenter" args)
               {delegate_ctlc = True, close_fds = True}) waitForProcess
             exitWith result
-        _ -> invalid "missing mount namespace descriptor"
-  where
+      _ -> invalid "missing mount namespace descriptor"
 
 -- The caller's terminal belongs to another devpts instance. Allocate the new
 -- terminal after nsenter has joined the session, and relay input/output to it.
