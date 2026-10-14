@@ -19,7 +19,7 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import System.Exit (ExitCode(..), die, exitWith)
 import System.FilePath ((</>), takeDirectory)
 import System.IO (hClose, hFlush, hGetLine, hPutStrLn)
-import System.Posix.Files (fileMode, getFileStatus, readSymbolicLink, setFileMode)
+import System.Posix.Files (fileMode, fileOwner, getFileStatus, readSymbolicLink, setFileMode)
 import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
@@ -166,7 +166,14 @@ spec = describe "workcell CLI" $ do
       (code, _, _) <- sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c", "exit 23"]
       code `shouldBe` ExitFailure 23
 
-  it "enters as the original user in both private and shared process modes" $ \ctx -> do
+  it "requires --enter for namespace-root access" $ \ctx -> do
+    forM_ [["--root"], ["--root", "--list"], ["--root", "--dryrun", "-H", "unwanted"]] $ \args -> do
+      (code, _, err) <- sessionInvoke ctx args
+      code `shouldNotBe` ExitSuccess
+      err `shouldContain` "--root requires --enter"
+    doesDirectoryExist (project ctx </> "unwanted") >>= (`shouldBe` False)
+
+  it "enters as the original user or namespace root in both process modes" $ \ctx -> do
     uid <- getEffectiveUserID
     gid <- getEffectiveGroupID
     forM_ [[], ["--share-processes"]] $ \flags ->
@@ -183,6 +190,12 @@ spec = describe "workcell CLI" $ do
         out <- successful =<< sessionInvoke ctx ["--enter", ident, "--", "/bin/sh", "-c",
           "id -u; id -g; readlink /proc/self/ns/user"]
         lines out `shouldBe` [show uid, show gid, namespace]
+        rooted <- successful =<< sessionInvoke ctx ["--enter", ident, "--root", "--", "/bin/sh", "-c",
+          "id -u; id -g; touch root-owned-marker; echo \"$WORKCELL_ACTIVE\""]
+        lines rooted `shouldBe` ["0", "0", "1"]
+        getFileStatus (project ctx </> "root-owned-marker") >>= (`shouldBe` uid) . fileOwner
+        preview <- successful =<< sessionInvoke ctx ["--enter", ident, "--root", "--dryrun"]
+        preview `shouldContain` "nsenter"
 
   it "enters with a usable terminal and preserves input, arguments, and exit status" $ \ctx -> do
     uid <- getEffectiveUserID
@@ -195,28 +208,29 @@ spec = describe "workcell CLI" $ do
             (master, slave) <- openPseudoTerminal
             (,) <$> Posix.fdToHandle master <*> Posix.fdToHandle slave
           close (master, slave) = hClose master >> hClose slave
-      bracket open close $ \(master, slave) -> do
-        let invocation = (proc (binary ctx)
-              ["--enter", ident, "--", "/bin/sh", "-c", unlines
-               ["set -eu", "test -t 0 && test -t 1 && test -t 2",
-                "device=$(tty); test -c \"$device\"",
-                "stty -F /dev/tty -a >/dev/null", "stty -echo", "printf 'ready\\n'",
-                "IFS= read -r answer", "test \"$answer\" = 'terminal input'",
-                "test \"$1\" = \"literal ' argument\"",
-                "test \"$(id -u)\" = \"$2\"; test \"$(id -g)\" = \"$3\"", "exit 23"],
-               "check", "literal ' argument", show uid, show gid])
-              {env = Just environment, std_in = UseHandle slave,
-               std_out = UseHandle slave, std_err = UseHandle slave}
-        result <- timeout (5 * 1000000) $
-          bracket (createProcess invocation)
-            (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
-            \(_, _, _, handle) -> do
-              ready <- hGetLine master
-              ready `shouldBe` "ready\r"
-              hPutStrLn master "terminal input"
-              hFlush master
-              waitForProcess handle
-        result `shouldBe` Just (ExitFailure 23)
+      forM_ [([], show uid, show gid), (["--root"], "0", "0")] $ \(flags, expectedUID, expectedGID) ->
+        bracket open close $ \(master, slave) -> do
+          let invocation = (proc (binary ctx)
+                (["--enter", ident] ++ flags ++ ["--", "/bin/sh", "-c", unlines
+                 ["set -eu", "test -t 0 && test -t 1 && test -t 2",
+                  "device=$(tty); test -c \"$device\"",
+                  "stty -F /dev/tty -a >/dev/null", "stty -echo", "printf 'ready\\n'",
+                  "IFS= read -r answer", "test \"$answer\" = 'terminal input'",
+                  "test \"$1\" = \"literal ' argument\"",
+                  "test \"$(id -u)\" = \"$2\"; test \"$(id -g)\" = \"$3\"", "exit 23"],
+                 "check", "literal ' argument", expectedUID, expectedGID]))
+                {env = Just environment, std_in = UseHandle slave,
+                 std_out = UseHandle slave, std_err = UseHandle slave}
+          result <- timeout (5 * 1000000) $
+            bracket (createProcess invocation)
+              (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
+              \(_, _, _, handle) -> do
+                ready <- hGetLine master
+                ready `shouldBe` "ready\r"
+                hPutStrLn master "terminal input"
+                hFlush master
+                waitForProcess handle
+          result `shouldBe` Just (ExitFailure 23)
 
   it "ignores stale, mismatched, malformed and publicly readable session records" $ \ctx -> do
     withRunningSession ctx [] $ \ident -> do

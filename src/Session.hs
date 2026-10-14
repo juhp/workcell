@@ -232,8 +232,8 @@ ownerNamespace :: Fd -> IO Fd
 ownerNamespace (Fd fd) = Fd <$> throwErrnoIfMinus1 "mount namespace owner"
   (namespaceIoctl fd getOwnerNamespace 0)
 
-enterSession :: String -> Bool -> [String] -> IO ()
-enterSession ident dry command = do
+enterSession :: String -> Bool -> Bool -> [String] -> IO ()
+enterSession ident dry root command = do
   unless (validID ident) $ invalid "invalid session ID (use --list)"
   matches <- filter ((== ident) . sessionID) <$> sessions
   record <- case matches of
@@ -249,6 +249,9 @@ enterSession ident dry command = do
         ["net" | sessionNetwork details /= "host"]
       flag "mnt" = "--mount"
       flag name = "--" ++ name
+      -- Preserve the mapped host credentials in either mode: setup-namespace
+      -- UID/GID 0 already maps to the invoking account, and setgroups is denied
+      -- in unprivileged user namespaces.
       tailArgs = ["--target", show pid, "--env", "--preserve-credentials"]
   withDescriptors [procPath pid ("ns" </> name) | name <- namespaces] $ \fds ->
     case fds of
@@ -260,20 +263,27 @@ enterSession ident dry command = do
         -- Mount/network entry requires their owning user namespace. Bubblewrap
         -- may then use a child user namespace to restore the invoking UID/GID.
         -- Join that final namespace only after entering the other namespaces.
-        finalCommand <- if ownerUser == targetUser then pure entryCommand else do
-          insidePID <- if sessionSharedProcesses details then pure (show pid) else do
-            status <- lines <$> strictRead (procPath pid "status")
-            case [inside | line <- status, "NSpid:":ids <- [words line], inside:_ <- [reverse ids]] of
-              [inside] -> pure inside
-              _ -> invalid "cannot determine session PID inside its namespace"
-          nsenter <- findExecutable "nsenter" >>= maybe (invalid "nsenter is required for entry") pure
-          pure $ [nsenter, "--user=/proc/" ++ insidePID ++ "/ns/user", "--preserve-credentials", "--"] ++ entryCommand
-        if dry then putStrLn $ unwords $ map quote $
-          ["nsenter", "--user=" ++ procPath pid "ns/user"] ++
-          ["--user-parent" | ownerUser /= targetUser] ++
-          [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
-          tailArgs ++ ["--root", "--wd", "--"] ++ finalCommand
-        else do
+        finalCommand <-
+          if root || ownerUser == targetUser
+          then pure entryCommand
+          else do
+            insidePID <-
+              if sessionSharedProcesses details
+              then pure (show pid)
+              else do
+                status <- lines <$> strictRead (procPath pid "status")
+                case [inside | line <- status, "NSpid:":ids <- [words line], inside:_ <- [reverse ids]] of
+                  [inside] -> pure inside
+                  _ -> invalid "cannot determine session PID inside its namespace"
+            nsenter <- findExecutable "nsenter" >>= maybe (invalid "nsenter is required for entry") pure
+            pure $ [nsenter, "--user=/proc/" ++ insidePID ++ "/ns/user", "--preserve-credentials", "--"] ++ entryCommand
+        if dry
+          then putStrLn $ unwords $ map quote $
+               ["nsenter", "--user=" ++ procPath pid "ns/user"] ++
+               ["--user-parent" | ownerUser /= targetUser] ++
+               [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
+               tailArgs ++ ["--root", "--wd", "--"] ++ finalCommand
+          else do
           needProgram "nsenter"
           withDescriptors [procPath pid "root", procPath pid "cwd"] $ \directories -> do
             valid <- validSession record

@@ -7,7 +7,7 @@ import Control.Monad (forM, unless, void, when)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
 import SimpleCmd (cmdFull, needProgram)
@@ -40,6 +40,7 @@ data Options = Options
   , shareNetwork :: Bool
   , listOption :: Bool
   , enterOption :: Maybe String
+  , rootOption :: Bool
   , command :: [String]
   }
 
@@ -60,6 +61,7 @@ data Launch = Launch
 
 runWorkcell :: Options -> IO ()
 runWorkcell opts
+  | rootOption opts && isNothing (enterOption opts) = invalid "--root requires --enter"
   | listOption opts || isJust (enterOption opts) = do
       when (listOption opts && isJust (enterOption opts)) $
         invalid "--list and --enter cannot be combined"
@@ -73,7 +75,7 @@ runWorkcell opts
           when (dryRun opts || not (null $ command opts)) $ invalid "--list does not accept --dryrun or a command"
           listSessions
         else maybe (invalid "missing session ID")
-          (\ident -> withTermination $ enterSession ident (dryRun opts) (command opts)) (enterOption opts)
+          (\ident -> withTermination $ enterSession ident (dryRun opts) (rootOption opts) (command opts)) (enterOption opts)
   | otherwise = withTermination $ launchWorkcell opts
 
 -- Turn termination into an exception so session/helper brackets can clean up.

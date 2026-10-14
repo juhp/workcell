@@ -39,6 +39,7 @@ From another terminal in the same enclosing environment:
 workcell --list
 workcell --enter s123456               # use an ID from --list; starts Bash
 workcell --enter s123456 -- git status
+workcell --enter s123456 --root        # root inside the workcell
 workcell --enter s123456 --dryrun
 ```
 
@@ -48,6 +49,10 @@ initial command environment, and isolated process/network namespaces.
 Entry also joins the initial command's user namespace, preserving the invoking
 user's UID/GID rather than leaving the command as root in bubblewrap's setup
 namespace.
+Use `--enter ID --root` to run as UID/GID 0 in the user namespace that owns
+the session's mounts instead. This namespace root maps to the invoking host
+account and does not grant host-root privileges. `--root` requires `--enter`
+and also works with an explicit command or `--dryrun`.
 Shared process or network namespaces are left unchanged. Session operations cannot be
 combined with launch options such as `--home`, `--volume`, or `--network`.
 When both input and output are terminals, entry allocates a new terminal inside
