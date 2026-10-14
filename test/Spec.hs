@@ -698,8 +698,10 @@ spec = describe "workcell CLI" $ do
     environment <- getEnvironment
     let runtime = root ctx </> "wayland-runtime"
         socket = runtime </> "wayland-0"
-        supplied display = setVariables ([("XDG_RUNTIME_DIR", runtime)] ++
-          [("WAYLAND_DISPLAY", value) | Just value <- [display]]) $
+        supplied display =
+          setVariables
+          (("XDG_RUNTIME_DIR", runtime) :
+           [("WAYLAND_DISPLAY", value) | Just value <- [display]]) $
           filter ((/= "WAYLAND_DISPLAY") . fst) environment
     createDirectory runtime
     writeFile (runtime </> "private-marker") "hidden"
