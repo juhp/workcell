@@ -26,11 +26,14 @@ import GHC.Generics (Generic)
 import System.Directory
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), isAbsolute, takeFileName)
-import System.IO (hClose, openBinaryTempFile)
+import System.IO
+  (Handle, hClose, hFlush, hIsEOF, hIsTerminalDevice, hPutStr, hPutStrLn,
+   openBinaryTempFile, stderr, stdin, stdout)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files
 import System.Posix.User (getEffectiveUserID)
 import System.Timeout (timeout)
+import Text.Read (readMaybe)
 
 data SessionDetails = SessionDetails
   { sessionProject :: Maybe FilePath
@@ -211,12 +214,17 @@ listSessions :: IO ()
 listSessions = sessions >>= printSessions
 
 printSessions :: [Session] -> IO ()
-printSessions records =
+printSessions = printSessionRows stdout False
+
+printSessionRows :: Handle -> Bool -> [Session] -> IO ()
+printSessionRows output numbered records =
   unless (null records) $ do
-    let rows = ["ID", "PROJECT", "NETWORK", "COMMAND"] : map row records
-        widths = map (maximum . map length) (transpose $ map (take 3) rows) ++ [0]
+    let header = ["#" | numbered] ++ ["ID", "PROJECT", "NETWORK", "COMMAND"]
+        rows = header : zipWith (\index record ->
+          [show index | numbered] ++ row record) [1 :: Int ..] records
+        widths = map (maximum . map length) (transpose $ map init rows) ++ [0]
         pad width value = value ++ replicate (width - length value) ' '
-    mapM_ (putStrLn . intercalate "  " . zipWith pad widths) rows
+    mapM_ (hPutStrLn output . intercalate "  " . zipWith pad widths) rows
   where
     row record =
       let details = sessionDetails record
@@ -230,11 +238,39 @@ findSession Nothing = do
     [found] -> pure found
     [] -> invalid "no active sessions in this PID namespace (use workcell list)"
     _ -> do
-      printSessions records
-      invalid "multiple active sessions; specify a session ID"
+      interactive <- hIsTerminalDevice stdin
+      if interactive
+        then chooseSession records
+        else do
+          printSessions records
+          hFlush stdout
+          invalid "multiple active sessions; specify a session ID"
 findSession (Just ident) = do
   unless (validID ident) $ invalid "invalid session ID (use workcell list)"
   matches <- filter ((== ident) . sessionID) <$> sessions
   case matches of
     [found] -> pure found
     _ -> invalid $ "unknown or expired session " ++ ident ++ " in this PID namespace (use workcell list)"
+
+-- Keep the displayed snapshot stable while the user chooses its row number.
+chooseSession :: [Session] -> IO Session
+chooseSession records = do
+  printSessionRows stderr True records
+  prompt
+  where
+    count = length records
+    prompt = do
+      hPutStr stderr $ "Select a workcell [1-" ++ show count ++ "] (Enter to cancel): "
+      hFlush stderr
+      eof <- hIsEOF stdin
+      when eof $ invalid "session selection cancelled"
+      answer <- getLine
+      when (null $ words answer) $ invalid "session selection cancelled"
+      case readMaybe answer :: Maybe Integer of
+        Just index | index >= 1 && index <= toInteger count ->
+          case drop (fromInteger index - 1) records of
+            selected:_ -> pure selected
+            [] -> invalid "invalid session selection"
+        _ -> do
+          hPutStrLn stderr $ "Please enter a number from 1 to " ++ show count ++ "."
+          prompt

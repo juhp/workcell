@@ -49,10 +49,12 @@ workcell enter s123456 --root        # root inside the workcell
 workcell enter s123456 --dryrun
 ```
 
-The session ID is optional when exactly one active session is visible. With
-multiple sessions, `enter` lists the active workcells and returns an error;
-supply an ID to choose one. With no active sessions, it reports an error. `--root` and `--dryrun` also
-work without an ID. Supply an explicit ID when passing a command.
+The session ID is optional. With one active session, `enter` uses it automatically.
+With multiple sessions and terminal input, it shows a numbered menu and prompts
+for a choice; press Enter to cancel. Without terminal input, it lists the sessions
+and returns an error asking for an ID. With no active sessions, it reports an error.
+`--root` and `--dryrun` also work without an ID. Supply an explicit ID when passing
+a command.
 
 Entry requires `nsenter` (from util-linux) and runs without sudo. It starts an
 additional command using the session's filesystem root, working directory,

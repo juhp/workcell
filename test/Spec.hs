@@ -9,6 +9,7 @@ import Data.Aeson (Value(..), eitherDecodeStrict', encode)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe, isNothing)
 import qualified Network.Socket as Net
@@ -16,7 +17,7 @@ import System.Directory hiding (executable)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..), die, exitWith)
 import System.FilePath ((</>), takeDirectory)
-import System.IO (hClose, hFlush, hGetLine, hPutStrLn)
+import System.IO (hClose, hFlush, hGetLine, hPutStr, hPutStrLn)
 import System.Posix.Files (fileMode, fileOwner, getFileStatus, readSymbolicLink, setFileMode)
 import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
@@ -177,6 +178,28 @@ spec = describe "workcell CLI" $ do
       length (lines output) `shouldBe` 2
     sessionInvoke ctx ["list"] >>= successful >>= (`shouldBe` "")
     sessionRecordPaths ctx >>= (`shouldBe` [])
+
+  it "offers a numbered session menu and validates choices on terminal input" $ \ctx -> do
+    withRunningSession ctx [] $ \_ ->
+      withRunningSession ctx [] $ \_ -> do
+        listing <- successful =<< sessionInvoke ctx ["list"]
+        let identifiers = [ident | row <- drop 1 $ lines listing, ident:_ <- [words row]]
+        length identifiers `shouldBe` 2
+        forM_ (zip [1 :: Int ..] identifiers) $ \(index, ident) ->
+          forM_ [[], ["--root"]] $ \flags -> do
+            expected <- successful =<< sessionInvoke ctx (["enter", ident, "--dryrun"] ++ flags)
+            (code, output, menu) <- menuInvoke ctx flags ("bad\n0\n3\n" ++ show index ++ "\n")
+            code `shouldBe` ExitSuccess
+            output `shouldBe` expected
+            forM_ identifiers $ \name -> menu `shouldContain` name
+            menu `shouldContain` "#"
+            menu `shouldContain` "Select a workcell [1-2]"
+            menu `shouldContain` "Please enter a number from 1 to 2."
+        forM_ ["\n", "\4"] $ \answer -> do
+          (code, output, menu) <- menuInvoke ctx [] answer
+          code `shouldNotBe` ExitSuccess
+          output `shouldBe` ""
+          menu `shouldContain` "session selection cancelled"
 
   it "enters a running workcell without sudo and preserves its environment and filesystem" $ \ctx -> do
     helper <- findExecutable "nsenter"
@@ -1216,6 +1239,29 @@ sessionInvoke :: Context -> [String] -> IO (ExitCode, String, String)
 sessionInvoke ctx args = do
   environment <- sessionEnvironment ctx
   capture $ (proc (binary ctx) args) {cwd = Just (project ctx), env = Just environment}
+
+-- Supply a real terminal for menu input, while keeping preview and menu output separate.
+menuInvoke :: Context -> [String] -> String -> IO (ExitCode, String, String)
+menuInvoke ctx flags answer = do
+  environment <- sessionEnvironment ctx
+  let open = do
+        (master, slave) <- openPseudoTerminal
+        (,) <$> Posix.fdToHandle master <*> Posix.fdToHandle slave
+      close (master, slave) = hClose master >> hClose slave
+  result <- timeout (5 * 1000000) $ bracket open close $ \(master, slave) -> do
+    let invocation = (proc (binary ctx) (["enter", "--dryrun"] ++ flags))
+          {cwd = Just (project ctx), env = Just environment,
+           std_in = UseHandle slave, std_out = CreatePipe, std_err = CreatePipe}
+    bracket (createProcess invocation)
+      (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
+      \(_, output, errors, handle) -> do
+        hPutStr master answer
+        hFlush master
+        code <- waitForProcess handle
+        out <- maybe (fail "missing stdout pipe") BS.hGetContents output
+        err <- maybe (fail "missing stderr pipe") BS.hGetContents errors
+        pure (code, BSC.unpack out, BSC.unpack err)
+  maybe (fail "session menu timed out") pure result
 
 sessionRecordPaths :: Context -> IO [FilePath]
 sessionRecordPaths ctx = do
