@@ -5,7 +5,6 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 module Network
   (NetworkMode(..),
-   networkMode,
    pastaArguments,
    verifyNetwork,
    runPrivateNetwork,
@@ -48,20 +47,8 @@ import System.Process
    getPid, getProcessExitCode, proc, terminateProcess, waitForProcess)
 import System.Timeout (timeout)
 
-data NetworkMode = PrivateNetwork | NoNetwork | HostNetwork
+data NetworkMode = PrivateNetwork | HostNetwork | NoNetwork
   deriving (Eq)
-
-networkMode :: Maybe String -> Bool -> IO NetworkMode
-networkMode option shared = do
-  when (shared && isJust option) $
-    invalid "--share-network and --network cannot be combined"
-  case (shared, option) of
-    (True, _) -> pure HostNetwork
-    (_, Nothing) -> pure PrivateNetwork
-    (_, Just "private") -> pure PrivateNetwork
-    (_, Just "none") -> pure NoNetwork
-    (_, Just "host") -> pure HostNetwork
-    _ -> invalid "invalid network mode (expected private, none, or host)"
 
 pastaArguments :: FilePath -> FilePath -> FilePath -> [String]
 pastaArguments netns userns pidfile =
@@ -100,7 +87,7 @@ verifyNetwork mode processArgs = do
     unavailable reason = invalid $
       (if mode == PrivateNetwork then "private networking" else "network isolation")
       ++ " is unavailable. " ++ reason ++ "\n"
-      ++ "Use --share-network only if sharing the enclosing network is acceptable."
+      ++ "Try --network-host, if sharing the enclosing network is acceptable."
 
 newtype SandboxInfo = SandboxInfo Int
 

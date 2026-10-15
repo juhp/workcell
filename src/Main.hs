@@ -11,7 +11,7 @@ import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
 
 import Enter (enterSession)
 import Paths_workcell (version)
-import Run (Options(..), runWorkcell)
+import Run (Options(..), runWorkcell, NetworkMode(..))
 import Session (listSessions)
 
 main :: IO ()
@@ -54,6 +54,7 @@ options = Options
   <*> switchLongWith "dryrun" "Print the bubblewrap command without changing files"
   <*> switchLongWith "share-processes" "Share enclosing processes and /proc instead of isolating them"
   <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"
-  <*> optional (strOptionLongWith "network" "MODE" "Networking: private (default, requires pasta), none, or host")
-  <*> switchLongWith "share-network" "Share the enclosing network (alias for --network host)"
+  <*> optional (flagLongWith' HostNetwork "network-host" "Use host networking" <|>
+                flagLongWith' NoNetwork "network-none" "Disable networking except private loopback" <|>
+                flagLongWith' PrivateNetwork "network-private" "Use a private pasta network (default)")
   <*> many (strArg "[--] COMMAND ARG...")

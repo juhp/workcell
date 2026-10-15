@@ -91,6 +91,7 @@ benchmark bench
   hs-source-dirs:      bench
   build-depends:       base < 5,
                        process,
+                       simple-cmd,
                        tasty,
                        tasty-bench >= 0.4
   build-tool-depends:  workcell:workcell

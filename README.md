@@ -40,10 +40,11 @@ The main way to use workcell is to start a bwrap session.
 `$ workcell run --help`
 
 ```
-Usage: workcell run [-p|--project DIR] [-H|--home DIR] 
-                    [-v|--volume SOURCE[:DEST][:ro|rw]] [-e|--env KEY[=VALUE]] 
-                    [--wayland] [--x11] [--dbus] [--dryrun] [--share-processes] 
-                    [--share-filesystem] [--network MODE] [--share-network] 
+Usage: workcell run [-p|--project DIR] [-H|--home DIR]
+                    [-v|--volume SOURCE[:DEST][:ro|rw]] [-e|--env KEY[=VALUE]]
+                    [--wayland] [--x11] [--dbus] [--dryrun] [--share-processes]
+                    [--share-filesystem]
+                    [--network-host | --network-none | --network-private]
                     [[--] COMMAND ARG...]
 
   Run a workcell bwrap session
@@ -65,10 +66,9 @@ Available options:
                            isolating them
   --share-filesystem       Expose the enclosing filesystem read-only, retaining
                            isolated home
-  --network MODE           Networking: private (default, requires pasta), none,
-                           or host
-  --share-network          Share the enclosing network (alias for --network
-                           host)
+  --network-host           Use host networking
+  --network-none           Disable networking except private loopback
+  --network-private        Use a private pasta network (default)
   -h,--help                Show this help text
 ```
 
@@ -105,7 +105,7 @@ $ workcell run -e LANG -e MY_VAR=hello -- env
 $ workcell run --dryrun -- gcc --version
 $ workcell run --share-processes   # fallback for restricted containers
 $ workcell run --share-filesystem -- ls /var/log   # expose enclosing filesystem read-only
-$ workcell run --network none   # offline, separate loopback network
+$ workcell run --network-none   # offline, separate loopback network
 $ workcell run --share-network -- curl localhost:8000   # share enclosing network
 $ workcell run --wayland gtk4-demo
 $ workcell run --x11 xterm

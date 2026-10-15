@@ -1,5 +1,9 @@
 -- SPDX-License-Identifier: BSD-3-Clause
-module Run (Options(..), runWorkcell) where
+module Run (
+  Options(..),
+  NetworkMode(..),
+  runWorkcell)
+where
 
 import Control.Exception (bracket)
 import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
@@ -20,7 +24,7 @@ import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
 import System.Posix.IO (OpenMode(..), closeFd)
 
-import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork, openSimpleFd)
+import Network (NetworkMode(..), pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork, openSimpleFd)
 import Session (SessionDetails(..), withSession)
 
 data Options = Options
@@ -34,8 +38,7 @@ data Options = Options
   , dryRun :: Bool
   , shareProcesses :: Bool
   , shareFilesystem :: Bool
-  , networkOption :: Maybe String
-  , shareNetwork :: Bool
+  , networkOption :: Maybe NetworkMode
   , command :: [String]
   }
 
@@ -88,10 +91,11 @@ runWorkcell opts = do
             warning $ "created" +-+ dir
           createDirectoryIfMissing True dir
         let mode = selectedNetwork launch
-            modeName = case mode of
-              PrivateNetwork -> "private"
-              NoNetwork -> "none"
-              HostNetwork -> "host"
+            modeName =
+              case mode of
+                PrivateNetwork -> "private"
+                HostNetwork -> "host"
+                NoNetwork -> "none"
             details = SessionDetails (launchProject launch)
               (if null (command opts) then ["/bin/bash"] else command opts)
               modeName (shareProcesses opts)
@@ -110,7 +114,7 @@ withSystemFiles ((index, path):rest) action =
 -- Validate paths and construct argv before creating any persistent home.
 prepare :: Options -> IO Launch
 prepare opts = do
-  mode <- networkMode (networkOption opts) (shareNetwork opts)
+  let mode = fromMaybe PrivateNetwork $ networkOption opts
   candidate <- existingDirectory "project" (fromMaybe "." $ projectOption opts)
   originalHome <- getHomeDirectory
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
