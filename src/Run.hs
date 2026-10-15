@@ -2,14 +2,14 @@
 module Run (Options(..), runWorkcell) where
 
 import Control.Exception (bracket)
-import Control.Monad (forM, unless, when)
+import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
-import SimpleCmd (cmdFull, needProgram)
+import SimpleCmd (cmdFull, needProgram, warning, (+-+))
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
@@ -83,7 +83,10 @@ runWorkcell opts = do
       withSystemFiles (copiedSystemFiles launch) $ \descriptors -> do
         let liveArgs = [fromMaybe arg (lookup index descriptors) |
                         (index, arg) <- zip [0..] (arguments launch)]
-        mapM_ (createDirectoryIfMissing True) (persistentHome launch)
+        whenJust (persistentHome launch) $ \dir -> do
+          unlessM (doesDirectoryExist dir) $
+            warning $ "created" +-+ dir
+          createDirectoryIfMissing True dir
         let mode = selectedNetwork launch
             modeName = case mode of
               PrivateNetwork -> "private"

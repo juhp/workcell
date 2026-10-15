@@ -17,7 +17,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket, evaluate)
-import Control.Monad (unless, void, when)
+import Control.Monad.Extra (unless, void, when, whenJust)
 import Data.Aeson (FromJSON(..), eitherDecodeStrict', withObject, (.:))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -261,9 +261,8 @@ stopChild handle = do
         Just _ -> pure ()
         Nothing -> do
           pid <- getPid handle
-          mapM_ (signalProcess sigKILL) pid
-          _ <- waitForProcess handle
-          pure ()
+          whenJust pid $ signalProcess sigKILL
+          void $ waitForProcess handle
 
 withPipe :: ((Fd, Fd, Handle, Handle) -> IO a) -> IO a
 withPipe = bracket acquire release
