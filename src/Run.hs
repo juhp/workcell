@@ -10,7 +10,7 @@ import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
 import SimpleCmd (cmdFull, needProgram, warning, (+-+))
@@ -59,30 +59,38 @@ data Launch = Launch
 
 runWorkcell :: Options -> IO ()
 runWorkcell opts = do
-  launch <- prepare opts
+  planned <- prepare opts
+  when (dryRun opts && isNothing (networkOption opts)) $
+    putStrLn "# trying private networking; fall back to host if preflight fails"
   if dryRun opts
-    then if selectedNetwork launch == PrivateNetwork || not (null $ copiedSystemFiles launch)
+    then if selectedNetwork planned == PrivateNetwork || not (null $ copiedSystemFiles planned)
       then do
         let networkPlan =
-              if selectedNetwork launch == PrivateNetwork
+              if selectedNetwork planned == PrivateNetwork
               then ["--info-fd", "<info-fd>",
                     "--ro-bind", "<ready-pipe>", "/run/workcell-network-ready",
-                    "--ro-bind-data", "<dns-fd>", resolverDestination launch]
+                    "--ro-bind-data", "<dns-fd>", resolverDestination planned]
               else []
-            preview = "bwrap" : networkPlan ++ arguments launch
+            preview = "bwrap" : networkPlan ++ arguments planned
         putStrLn $ "# " ++ unwords (map shellQuote preview)
-        when (selectedNetwork launch == PrivateNetwork) $
+        when (selectedNetwork planned == PrivateNetwork) $
           putStrLn $ "# " ++ unwords (map shellQuote $ "pasta" : pastaArguments "<netns>" "<userns>" "<pid-file>")
         executable <- getExecutablePath
         argv <- getArgs
         let (options, cmd) = break (== "--") argv
         putStrLn $ unwords $ map shellQuote $ executable : filter (/= "--dryrun") options ++ cmd
-      else putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments launch
+      else putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments planned
     else do
       needProgram "bwrap"
       unless (shareProcesses opts) verifyProcessIsolation
-      verifyNetwork (selectedNetwork launch)
-        (if shareProcesses opts then [] else privateProcArgs)
+      launch <- catchIOError (do
+        verifyNetwork (selectedNetwork planned)
+          (if shareProcesses opts then [] else privateProcArgs)
+        pure planned) $ \err ->
+          if isNothing (networkOption opts) then do
+            warning "falling back to host networking"
+            prepare opts {networkOption = Just HostNetwork}
+          else ioError err
       withSystemFiles (copiedSystemFiles launch) $ \descriptors -> do
         let liveArgs = [fromMaybe arg (lookup index descriptors) |
                         (index, arg) <- zip [0..] (arguments launch)]

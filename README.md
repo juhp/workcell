@@ -4,8 +4,8 @@ WIP (working title)
 
 Workcell is a Linux CLI tool using Bubblewrap to setup Linux namespaces
 to run programs with a read-only sysroot, an isolated homedir and restricted
-to a writable project/work dir (and runtime). Currently it uses a private
-network mode by default using pasta.
+to a writable project/work dir (and runtime). By default it attempts private
+networking using pasta, falling back to host networking if it fails.
 
 ## Usage
 
@@ -68,9 +68,14 @@ Available options:
                            isolated home
   --network-host           Use host networking
   --network-none           Disable networking except private loopback
-  --network-private        Use a private pasta network (default)
+  --network-private        Use a private pasta network (attempted by default)
   -h,--help                Show this help text
 ```
+
+Default networking tries to set up private networking but
+falls back to host networking if preflight fails.
+Workcell will print a warning before launching the command.
+`--network-private` requires successful private setup.
 
 ### `list` and `enter` commands
 
@@ -106,7 +111,7 @@ $ workcell run --dryrun -- gcc --version
 $ workcell run --share-processes   # fallback for restricted containers
 $ workcell run --share-filesystem -- ls /var/log   # expose enclosing filesystem read-only
 $ workcell run --network-none   # offline, separate loopback network
-$ workcell run --share-network -- curl localhost:8000   # share enclosing network
+$ workcell run --network-host -- curl localhost:8000   # share enclosing network
 $ workcell run --wayland gtk4-demo
 $ workcell run --x11 xterm
 ```

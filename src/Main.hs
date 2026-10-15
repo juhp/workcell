@@ -56,5 +56,5 @@ options = Options
   <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"
   <*> optional (flagLongWith' HostNetwork "network-host" "Use host networking" <|>
                 flagLongWith' NoNetwork "network-none" "Disable networking except private loopback" <|>
-                flagLongWith' PrivateNetwork "network-private" "Use a private pasta network (default)")
+                flagLongWith' PrivateNetwork "network-private" "Use a private pasta network (attempted by default)")
   <*> many (strArg "[--] COMMAND ARG...")

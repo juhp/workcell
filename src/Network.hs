@@ -14,8 +14,8 @@ module Network
    openSimpleFd)
 where
 
-import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, evaluate)
+import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, takeMVar, threadDelay)
+import Control.Exception (bracket, evaluate, throwIO)
 import Control.Monad.Extra (unless, void, when, whenJust)
 import Data.Aeson (FromJSON(..), eitherDecodeStrict', withObject, (.:))
 import qualified Data.ByteString as BS
@@ -25,13 +25,13 @@ import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import SimpleCmd (cmdFull)
 import System.Directory
-  (createDirectoryIfMissing, doesFileExist, doesPathExist, findExecutable, getFileSize, getHomeDirectory, getTemporaryDirectory,
+  (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getFileSize, getHomeDirectory, getTemporaryDirectory,
    removeFile, removePathForcibly)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), isAbsolute)
 import System.IO
-  (Handle, IOMode(..), SeekMode(..), hClose, hFileSize, hPutStr, hSeek,
+  (Handle, IOMode(..), SeekMode(..), hClose, hFileSize, hFlush, hPutStr, hSeek,
    openBinaryTempFile, openTempFile, withBinaryFile)
 import System.IO.Error (catchIOError, isDoesNotExistError, ioeGetErrorString)
 import System.Posix.IO
@@ -121,7 +121,9 @@ withPastaLog discardSuccess action = bracket acquire release $ \(path, handle) -
     when (discardSuccess && code /= ExitSuccess) $
       invalid $ "network preflight exited: " ++ show code
     pure code) $ \err -> do
-    -- Children have been stopped by their brackets before reading the log.
+    -- The helper and diagnostics copier have stopped. Release the writer
+    -- before opening the log for reading (GHC locks handles within a process).
+    hClose handle
     tailText <- catchIOError (diagnosticTail path) $ const $ pure "(unable to read pasta log)\n"
     invalid $ ioeGetErrorString err ++
       (if null tailText then "" else "\nPasta log: " ++ path ++
@@ -189,7 +191,15 @@ runTrackedSandbox track args = do
 runNetwork :: (Int -> IO ExitCode -> IO ExitCode) -> Handle -> [String] -> [String] -> FilePath -> IO ExitCode
 runNetwork track logHandle extraPastaArgs args resolverDestination = do
   tmp <- getTemporaryDirectory
-  bracket (mkdtemp $ tmp </> "workcell-network-") removePathForcibly $ \dir -> do
+  runtime <- lookupEnv "XDG_RUNTIME_DIR"
+  helperTmp <- case runtime of
+    Just directory | isAbsolute directory -> do
+      exists <- doesDirectoryExist directory
+      pure $ if exists then directory else "/tmp"
+    _ -> pure "/tmp"
+  -- Pasta may run in a confined SELinux domain which cannot write under HOME,
+  -- even when the invoking user has chosen a home directory as TMPDIR.
+  bracket (mkdtemp $ helperTmp </> "workcell-network-") removePathForcibly $ \dir -> do
     let readyPipe = dir </> "ready"
         sandboxPipe = "/run/workcell-network-ready"
     createNamedPipe readyPipe 0o600
@@ -220,8 +230,8 @@ runNetwork track logHandle extraPastaArgs args resolverDestination = do
                   helper = (proc "pasta" (extraPastaArgs ++
                     pastaArguments childNet (reference userFd) pidfile))
                     {std_in = NoStream, std_out = NoStream,
-                     std_err = UseHandle logHandle, close_fds = True}
-              withChild helper $ \network -> do
+                     std_err = CreatePipe, close_fds = True}
+              withPastaChild logHandle helper $ \network -> do
                 deadline "waiting for pasta network setup" $ waitReady pidfile child network
                 track pid $ do
                   void $ fdWrite gate "ready\n"
@@ -229,6 +239,30 @@ runNetwork track logHandle extraPastaArgs args resolverDestination = do
   where
     ownerNamespace (Fd fd) = Fd <$> throwErrnoIfMinus1 "network namespace owner"
       (namespaceIoctl fd getOwnerNamespace 0)
+
+-- Workcell writes the state log itself: a confined pasta may be unable to
+-- write an inherited file in HOME, while writing to a pipe is permitted.
+withPastaChild :: Handle -> CreateProcess -> (ProcessHandle -> IO a) -> IO a
+withPastaChild logHandle command action =
+  bracket acquire release $ \(child, _, _) -> action child
+  where
+    acquire = do
+      (_, _, output, child) <- createProcess command
+      reader <- maybe (stopChild child >> invalid "missing pasta diagnostics pipe") pure output
+      finished <- newEmptyMVar
+      _ <- forkFinally (copyDiagnostics reader) (putMVar finished)
+      pure (child, reader, finished)
+    release (child, reader, finished) = do
+      stopChild child
+      result <- takeMVar finished
+      hClose reader
+      either throwIO pure result
+    copyDiagnostics reader = do
+      bytes <- BS.hGetSome reader 8192
+      unless (BS.null bytes) $ do
+        BS.hPut logHandle bytes
+        hFlush logHandle
+        copyDiagnostics reader
 
 withChild :: CreateProcess -> (ProcessHandle -> IO a) -> IO a
 withChild command =

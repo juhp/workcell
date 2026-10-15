@@ -105,14 +105,20 @@ capture command = timeout (30 * 1000000) (readCreateProcessWithExitCode command 
 
 invoke :: Context -> Maybe Bool -> Maybe [(String, String)] -> [String]
        -> IO (ExitCode, String, String)
-invoke ctx shared environment args = capture $
+invoke ctx shared environment args = invokeDefault ctx shared environment $
+  ["--network-host" | not (hasNetworkOption args) && "--dryrun" `notElem` args] ++ args
+
+-- Exercise default fallback without the suite's usual explicit host mode.
+invokeDefault :: Context -> Maybe Bool -> Maybe [(String, String)] -> [String]
+              -> IO (ExitCode, String, String)
+invokeDefault ctx shared environment args = capture $
   (proc (binary ctx) ("run" : flags ++ args)) {cwd = Just (project ctx), env = environment}
   where
     sharing = fromMaybe (not (privateProc ctx) && "--dryrun" `notElem` args) shared
-    explicitNetwork = any (\arg -> arg == "--network" || arg == "--share-network" ||
-                          "--network=" `isPrefixOf` arg) (takeWhile (/= "--") args)
-    flags = ["--share-processes" | sharing] ++
-      ["--share-network" | not explicitNetwork && "--dryrun" `notElem` args]
+    flags = ["--share-processes" | sharing]
+
+hasNetworkOption :: [String] -> Bool
+hasNetworkOption = any ("--network-" `isPrefixOf`) . takeWhile (/= "--")
 
 success :: Context -> [String] -> IO String
 success ctx args = successful =<< invoke ctx Nothing Nothing args
@@ -325,18 +331,18 @@ spec = describe "workcell CLI" $ do
     let flags = ["--share-processes" | not $ privateProc ctx]
         run args = capture $ (proc (binary ctx) ("run" : flags ++ args))
           {cwd = Just (project ctx), env = Just environment}
-    _ <- successful =<< run ["--network", "host", "--", "/bin/true"]
+    _ <- successful =<< run ["--network-host", "--", "/bin/true"]
     sessionRecordPaths ctx >>= (`shouldBe` [])
-    _ <- successful =<< run ["--network", "host", "--dryrun"]
+    _ <- successful =<< run ["--network-host", "--dryrun"]
     sessionRecordPaths ctx >>= (`shouldBe` [])
-    (code, _, _) <- run ["--network", "host", "-v", "/missing-session-test"]
+    (code, _, _) <- run ["--network-host", "-v", "/missing-session-test"]
     code `shouldNotBe` ExitSuccess
     sessionRecordPaths ctx >>= (`shouldBe` [])
 
   it "uses state storage when the runtime directory is unset" $ \ctx -> do
     environment <- sessionEnvironment ctx
     let flags = ["--share-processes" | not $ privateProc ctx]
-    _ <- successful =<< capture ((proc (binary ctx) ("run" : flags ++ ["--network", "host", "--", "/bin/true"]))
+    _ <- successful =<< capture ((proc (binary ctx) ("run" : flags ++ ["--network-host", "--", "/bin/true"]))
       {cwd = Just (project ctx), env = Just $ filter ((/= "XDG_RUNTIME_DIR") . fst) environment})
     doesDirectoryExist (root ctx </> "session-state/workcell/sessions") >>= (`shouldBe` True)
 
@@ -346,7 +352,7 @@ spec = describe "workcell CLI" $ do
         flags = ["--share-processes" | not $ privateProc ctx]
         args = ["--ro-bind", "/", "/", "--proc", "/proc",
                 "--bind", project ctx, project ctx, "--", binary ctx, "run"] ++
-               flags ++ ["--network", "host", "--", "/bin/true"]
+               flags ++ ["--network-host", "--", "/bin/true"]
     createDirectory temporary
     _ <- successful =<< capture ((fixtureProcess args)
       {cwd = Just (project ctx), env = Just $ setVariables [("TMPDIR", temporary)] environment})
@@ -354,7 +360,7 @@ spec = describe "workcell CLI" $ do
 
   it "enters offline namespaces and respects shared process mode" $ \ctx -> do
     unless (privateNet ctx) $ pendingWith "network namespaces unavailable"
-    withRunningSession ctx ["--network", "none", "--share-processes"] $ \ident -> do
+    withRunningSession ctx ["--network-none", "--share-processes"] $ \ident -> do
       preview <- successful =<< sessionInvoke ctx ["enter", ident, "--dryrun"]
       preview `shouldContain` "--net="
       preview `shouldNotContain` "--pid="
@@ -406,10 +412,10 @@ spec = describe "workcell CLI" $ do
     out `shouldContain` "'pasta' '--foreground' '--config-net' '--no-map-gw'"
     out `shouldContain` "'-t' 'none' '-u' 'none' '-T' 'none' '-U' 'none'"
     out `shouldContain` "'--ro-bind-data' '<dns-fd>'"
-    offline <- success ctx ["--network", "none", "--dryrun"]
+    offline <- success ctx ["--network-none", "--dryrun"]
     offline `shouldContain` "'--unshare-net'"
     offline `shouldNotContain` "'pasta'"
-    host <- success ctx ["--share-network", "--dryrun"]
+    host <- success ctx ["--network-host", "--dryrun"]
     host `shouldNotContain` "'--unshare-net'"
     host `shouldNotContain` "'pasta'"
     fallback <- success ctx ["--share-filesystem", "--dryrun"]
@@ -420,7 +426,7 @@ spec = describe "workcell CLI" $ do
 
   it "shares the enclosing network only in host mode" $ \ctx -> do
     expected <- readSymbolicLink "/proc/self/ns/net"
-    forM_ [["--network", "host"], ["--share-network"]] $ \flags -> do
+    forM_ [["--network-host"]] $ \flags -> do
       success ctx (flags ++ ["--", "readlink", "/proc/self/ns/net"])
         >>= (`shouldBe` expected ++ "\n")
 
@@ -428,21 +434,23 @@ spec = describe "workcell CLI" $ do
     unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
     expected <- readSymbolicLink "/proc/self/ns/net"
     forM_ [[], ["--share-processes", "--share-filesystem"]] $ \flags -> do
-      success ctx (flags ++ ["--network", "none", "--", "readlink", "/proc/self/ns/net"])
+      success ctx (flags ++ ["--network-none", "--", "readlink", "/proc/self/ns/net"])
         >>= (`shouldNotBe` expected ++ "\n")
 
   it "separates private networking while preserving identity, hostname, DNS, and exit status" $ \ctx -> do
     unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
     expected <- readSymbolicLink "/proc/self/ns/net"
-    success ctx ["--network", "private", "--", "readlink", "/proc/self/ns/net"]
-      >>= (`shouldNotBe` expected ++ "\n")
+    forM_ [["--network-private"], []] $ \flags -> do
+      out <- successful =<< invokeDefault ctx Nothing Nothing
+        (flags ++ ["--", "readlink", "/proc/self/ns/net"])
+      out `shouldNotBe` expected ++ "\n"
     forM_ [["id", "-u"], ["id", "-g"], ["hostname"]] $ \args -> do
-      host <- success ctx $ ["--network", "host", "--"] ++ args
-      success ctx (["--network", "private", "--"] ++ args) `shouldReturn` host
-    success ctx ["--network", "private", "--", "cat", "/etc/resolv.conf"]
+      host <- success ctx $ ["--network-host", "--"] ++ args
+      success ctx (["--network-private", "--"] ++ args) `shouldReturn` host
+    success ctx ["--network-private", "--", "cat", "/etc/resolv.conf"]
       >>= (`shouldContain` "nameserver 169.254.1.1\n")
     (code, _, _) <- invoke ctx Nothing Nothing
-      ["--network", "private", "--", "/bin/sh", "-c", "exit 23"]
+      ["--network-private", "--", "/bin/sh", "-c", "exit 23"]
     code `shouldBe` ExitFailure 23
 
   it "blocks enclosing localhost services in offline and private modes" $ \ctx -> do
@@ -454,7 +462,7 @@ spec = describe "workcell CLI" $ do
       port <- case address of
         Net.SockAddrInet value _ -> pure $ show value
         _ -> fail "unexpected listener address"
-      let args mode = ["--network", mode, "--", "/bin/bash", "--noprofile", "--norc", "-c",
+      let args mode = ["--network-" ++ mode, "--", "/bin/bash", "--noprofile", "--norc", "-c",
                        "touch command-ran; exec 3<>/dev/tcp/127.0.0.1/\"$1\"", "check", port]
       _ <- success ctx $ args "host"
       forM_ ("none" : ["private" | pastaNet ctx]) $ \mode -> do
@@ -467,10 +475,10 @@ spec = describe "workcell CLI" $ do
     when (pastaNet ctx) $ pendingWith "private pasta networking is supported"
     let supplied = root ctx </> "must not be created"
     (code, _, err) <- invoke ctx (Just True) Nothing
-      ["--network", "private", "-H", supplied, "--", "/bin/sh", "-c", "touch command-ran"]
+      ["--network-private", "-H", supplied, "--", "/bin/sh", "-c", "touch command-ran"]
     code `shouldNotBe` ExitSuccess
     err `shouldContain` "private networking is unavailable"
-    err `shouldContain` "--share-network"
+    err `shouldContain` "--network-host"
     doesPathExist supplied `shouldReturn` False
     doesPathExist (project ctx </> "command-ran") `shouldReturn` False
 
@@ -485,18 +493,74 @@ spec = describe "workcell CLI" $ do
     forM_ ["host", "none"] $ \mode -> do
       when (mode /= "none" || privateNet ctx) $ do
         _ <- successful =<< invoke ctx (Just True) (Just envs)
-          ["--network", mode, "--", "/bin/true"]
+          ["--network-" ++ mode, "--", "/bin/true"]
         pure ()
     (code, _, err) <- invoke ctx (Just True) (Just envs)
-      ["--network", "private", "-H", supplied, "--", "/bin/true"]
+      ["--network-private", "-H", supplied, "--", "/bin/true"]
     code `shouldNotBe` ExitSuccess
     err `shouldContain` "pasta is not installed or not on PATH"
     doesPathExist supplied `shouldReturn` False
 
+  it "falls back to host networking by default before running the command once" $ \ctx -> do
+    let tools = root ctx </> "tools without pasta"
+        supplied = root ctx </> "auto home"
+    createDirectory tools
+    bwrap <- findExecutable "bwrap" >>= maybe (fail "bwrap disappeared") pure
+    createFileLink bwrap (tools </> "bwrap")
+    environment <- getEnvironment
+    namespace <- readSymbolicLink "/proc/self/ns/net"
+    let envs = setVariables [("PATH", tools)] environment
+    (code, output, err) <- invokeDefault ctx Nothing (Just envs)
+      ["-H", supplied, "--", "/bin/sh", "-c",
+       "echo run >> command-count; readlink /proc/self/ns/net; exit 23"]
+    code `shouldBe` ExitFailure 23
+    output `shouldBe` namespace ++ "\n"
+    err `shouldContain` "falling back to host networking"
+    readFile (project ctx </> "command-count") `shouldReturn` "run\n"
+    doesDirectoryExist supplied `shouldReturn` True
+    (strictCode, _, strictErr) <- invokeDefault ctx Nothing (Just envs)
+      ["--network-private", "--", "/bin/sh", "-c", "echo run >> command-count"]
+    strictCode `shouldNotBe` ExitSuccess
+    strictErr `shouldNotContain` "falling back"
+    strictErr `shouldContain` "pasta is not installed or not on PATH"
+    readFile (project ctx </> "command-count") `shouldReturn` "run\n"
+    dry <- successful =<< invokeDefault ctx Nothing (Just envs)
+      ["--dryrun", "-H", root ctx </> "dry home"]
+    dry `shouldContain` "fall back to host if preflight fails"
+    dry `shouldContain` "'pasta'"
+    dry `shouldNotContain` "'--network-host'"
+    doesPathExist (root ctx </> "dry home") `shouldReturn` False
+    (invalidCode, _, invalidErr) <- invokeDefault ctx Nothing (Just envs)
+      ["-v", root ctx </> "missing volume", "--", "/bin/true"]
+    invalidCode `shouldNotBe` ExitSuccess
+    invalidErr `shouldNotContain` "falling back"
+
+  it "records host networking for sessions that fall back by default" $ \ctx -> do
+    let tools = root ctx </> "tools without pasta"
+    createDirectory tools
+    bwrap <- findExecutable "bwrap" >>= maybe (fail "bwrap disappeared") pure
+    createFileLink bwrap (tools </> "bwrap")
+    environment <- sessionEnvironment ctx
+    let args = ["run"] ++
+          ["--share-processes" | not (privateProc ctx)] ++
+          ["--", "/bin/sh", "-c", "touch auto-ready; exec /bin/sleep 30"]
+        invocation = (proc (binary ctx) args)
+          {cwd = Just (project ctx), env = Just $ setVariables [("PATH", tools)] environment,
+           std_out = NoStream}
+    bracket (createProcess invocation)
+      (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $ \_ -> do
+        waitUntil $ doesFileExist (project ctx </> "auto-ready")
+        listing <- successful =<< sessionInvoke ctx ["list"]
+        length (lines listing) `shouldBe` 2
+        listing `shouldContain` "host"
+        listing `shouldNotContain` "private"
+        preview <- successful =<< sessionInvoke ctx ["enter", "--dryrun"]
+        preview `shouldNotContain` "--net="
+
   it "terminates private networking when its command is terminated" $ \ctx -> do
     unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
     let flags = ["--share-processes" | not (privateProc ctx)]
-        args = flags ++ ["--network", "private", "--", "/bin/sh", "-c",
+        args = flags ++ ["--network-private", "--", "/bin/sh", "-c",
                          "touch network-ready; exec /bin/sleep 30"]
     bracket (createProcess ((proc (binary ctx) ("run" : args)) {cwd = Just (project ctx)}))
       (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
@@ -566,6 +630,47 @@ spec = describe "workcell CLI" $ do
       status <- getFileStatus path
       (fileMode status .&. 0o777) `shouldBe` 0o600
     doesPathExist (project ctx </> "command-ran") `shouldReturn` False
+
+  it "keeps pasta readiness files out of a home-based TMPDIR" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    environment <- getEnvironment
+    let temporary = root ctx </> "home temporary directory"
+        runtime = root ctx </> "helper runtime"
+        helper = unlines
+          ["while [ \"$1\" != --pid ]; do shift; done",
+           "printf '%s' \"$2\" > helper-pid-path", "echo $$ > \"$2\"",
+           "exec /bin/sleep 30"]
+    createDirectory temporary
+    createDirectory runtime
+    invocation <- fakeHelperCommand ctx helper ["/bin/true"]
+    forM_ [Just runtime, Nothing] $ \selectedRuntime -> do
+      let envs = setVariables
+                 (("TMPDIR", temporary) :
+                  [("XDG_RUNTIME_DIR", directory) | Just directory <- [selectedRuntime]]) $
+                 filter ((/= "XDG_RUNTIME_DIR") . fst) (fromMaybe environment $ env invocation)
+      _ <- successful =<< capture (invocation {env = Just envs})
+      pidPath <- readFile (project ctx </> "helper-pid-path")
+      pidPath `shouldSatisfy` ((fromMaybe "/tmp" selectedRuntime ++ "/workcell-network-") `isPrefixOf`)
+      doesPathExist (takeDirectory pidPath) `shouldReturn` False
+
+  it "drains large pasta diagnostics into the retained log before reporting failure" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    let helper = unlines
+          ["echo first-diagnostic >&2", "n=0; while [ \"$n\" -lt 5000 ]; do",
+           "echo 'diagnostic padding to exceed the pipe buffer size' >&2",
+           "n=$((n + 1)); done", "echo final-diagnostic >&2", "exit 42"]
+    invocation <- fakeHelperCommand ctx helper ["/bin/true"]
+    (code, _, err) <- capture invocation
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "final-diagnostic"
+    err `shouldNotContain` "first-diagnostic"
+    logs <- pastaLogs ctx
+    length logs `shouldBe` 1
+    forM_ logs $ \path -> do
+      content <- readFile path
+      content `shouldContain` "first-diagnostic"
+      content `shouldContain` "final-diagnostic"
+      length content `shouldSatisfy` (> 65536)
 
   it "logs helper warnings quietly and keeps distinct logs for concurrent runs" $ \ctx -> do
     unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
@@ -664,9 +769,9 @@ spec = describe "workcell CLI" $ do
     environment <- getEnvironment
     let envs = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
     _ <- successful =<< invoke ctx Nothing (Just envs) ["--dryrun"]
-    _ <- successful =<< invoke ctx Nothing (Just envs) ["--share-network", "--", "/bin/true"]
+    _ <- successful =<< invoke ctx Nothing (Just envs) ["--network-host", "--", "/bin/true"]
     when (privateNet ctx) $ do
-      _ <- successful =<< invoke ctx Nothing (Just envs) ["--network", "none", "--", "/bin/true"]
+      _ <- successful =<< invoke ctx Nothing (Just envs) ["--network-none", "--", "/bin/true"]
       pure ()
     doesPathExist (root ctx </> "state/workcell/logs") `shouldReturn` False
 
@@ -674,12 +779,12 @@ spec = describe "workcell CLI" $ do
     unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
     environment <- getEnvironment
     let stateEnv = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
-    _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network", "private", "--", "/bin/true"]
+    _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network-private", "--", "/bin/true"]
     retained <- pastaLogs ctx
     forM_ retained $ getFileSize >=> (`shouldSatisfy` (> 0))
     invocation <- fakeHelperCommand ctx "echo preflight-failure >&2\nexit 42" ["/bin/true"]
     (code, _, err) <- invoke ctx Nothing (env invocation)
-      ["--network", "private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
+      ["--network-private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
     code `shouldNotBe` ExitSuccess
     err `shouldContain` "preflight-failure"
     err `shouldContain` "Pasta log:"
@@ -738,7 +843,7 @@ spec = describe "workcell CLI" $ do
     out <- success ctx ["-H", supplied, "--dryrun", "--", "/usr/bin/printf", "%s", quoted]
     doesPathExist supplied `shouldReturn` False
     -- Let the shell parse the printed invocation; no shell expansion of argv is allowed.
-    let flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
+    let flags = "--network-host" : ["--share-processes" | not (privateProc ctx)]
     runnable <- success ctx $ flags ++ ["--dryrun", "--", "/usr/bin/printf", "%s", quoted]
     out `shouldContain` "'--'"
     executed <- successful =<< capture ((proc "/bin/sh" ["-c", runnable]) {cwd = Just (project ctx)})
@@ -827,7 +932,7 @@ spec = describe "workcell CLI" $ do
            "--ro-bind", directory, "/tmp/.X11-unix",
            "--setenv", "TMPDIR", "/tmp",
            "--setenv", "XDG_RUNTIME_DIR", "/tmp/workcell-x11-runtime",
-           "--", binary ctx, "run", "--network", "host"] ++
+           "--", binary ctx, "run", "--network-host"] ++
           ["--share-processes" | not $ privateProc ctx] ++ args)
           {cwd = Just $ project ctx, env = Just envs}
     createDirectory directory
@@ -960,8 +1065,11 @@ spec = describe "workcell CLI" $ do
           ["-v", root ctx ++ ":/tmp/duplicate", "-v", root ctx ++ ":/tmp/duplicate"],
           ["-v", root ctx ++ ":/usr/workcell-nonexistent-destination"], ["-H", "/"],
           ["-e", "BAD-NAME=value"], ["-p", "/proc"], ["-v", "/etc:/proc"],
-          ["-e", "WORKCELL_TEST_UNSET_82394"], ["--network", "invalid"],
-          ["--network", "none", "--share-network"]]
+          ["-e", "WORKCELL_TEST_UNSET_82394"], ["--network-invalid"],
+          ["--network-none", "--network-host"],
+          ["--network-private", "--network-host"],
+          ["--network-private", "--network-none"],
+          ["--network-auto"], ["--network", "host"], ["--share-network"]]
     forM_ cases $ \args -> void (failure ctx (args ++ ["--dryrun"]))
 
   it "validates before creating persistent home" $ \ctx -> do
@@ -978,7 +1086,7 @@ spec = describe "workcell CLI" $ do
 
   it "omits implicit projects at home and its ancestors" $ \ctx -> do
     let supplied = root ctx </> "isolated home"
-        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
+        flags = "--network-host" : ["--share-processes" | not (privateProc ctx)]
     createDirectory supplied
     writeFile (supplied </> "marker") "isolated"
     forM_ [home ctx, takeDirectory (home ctx), "/"] $ \directory -> do
@@ -1027,8 +1135,8 @@ spec = describe "workcell CLI" $ do
                      "--tmpfs", "/run", "--ro-bind-data", show fd, "/run/host/etc/localtime",
                      "--symlink", "/usr/bin/true", "/run/host/etc/unrelated", "--", binary ctx, "run"]
             volume = if override then ["-v", replacement ++ ":/etc/localtime"] else []
-            inner = processFlags ++ ["--network", mode, "-v", binary ctx] ++ volume ++ ["--", binary ctx, "run"] ++
-              processFlags ++ ["--share-network", "--", "/bin/sh", "-ec", script,
+            inner = processFlags ++ ["--network-" ++ mode, "-v", binary ctx] ++ volume ++ ["--", binary ctx, "run"] ++
+              processFlags ++ ["--network-host", "--", "/bin/sh", "-ec", script,
                                "check", "<system-file-0-fd>"]
         _ <- successful =<< capture ((fixtureProcess (outer ++ inner))
                                       {cwd = Just (project ctx), close_fds = False})
@@ -1057,7 +1165,7 @@ spec = describe "workcell CLI" $ do
         forM_ ("host" : ["none" | privateNet ctx]) $ \mode -> do
           writeFile (resolverDir </> "stub-resolv.conf") "initial\n"
           writeFile (resolverDir </> "replacement") "updated\n"
-          out <- run $ ["--network", mode] ++ ["--share-filesystem" | shared] ++
+          out <- run $ ["--network-" ++ mode] ++ ["--share-filesystem" | shared] ++
             ["--", "/bin/sh", "-ec", unlines
               ["cat /etc/resolv.conf",
                "mv resolver/replacement resolver/stub-resolv.conf",
@@ -1065,15 +1173,15 @@ spec = describe "workcell CLI" $ do
                "! (printf changed > /etc/resolv.conf)",
                "[ ! -e /run/host/etc/unrelated ]"]]
           out `shouldBe` "initial\nupdated\n"
-      run ["--share-network", "-v", overrideFile ++ ":/etc/resolv.conf:ro",
+      run ["--network-host", "-v", overrideFile ++ ":/etc/resolv.conf:ro",
            "--", "cat", "/etc/resolv.conf"] `shouldReturn` "override\n"
-      dry <- run ["--network", "private", "--dryrun"]
+      dry <- run ["--network-private", "--dryrun"]
       dry `shouldNotContain` ("'--ro-bind' '" ++ directory ++ "' '" ++ directory ++ "'")
       removeFile (sparseEtc </> "resolv.conf")
 
   it "starts when optional configuration files are absent or localtime is a dangling symlink" $ \ctx -> do
     let sparseEtc = root ctx </> "sparse etc"
-        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
+        flags = "--network-host" : ["--share-processes" | not (privateProc ctx)]
         args = ["--ro-bind", "/", "/", "--proc", "/proc", "--ro-bind", sparseEtc, "/etc",
                 "--", binary ctx, "run"] ++ flags ++
                ["--", "/bin/sh", "-c", "[ ! -e /etc/localtime ] && printf started"]
@@ -1085,7 +1193,7 @@ spec = describe "workcell CLI" $ do
                  ((fixtureProcess
                    ["--ro-bind", "/", "/", "--proc", "/proc",
                     "--ro-bind", sparseEtc, "/etc",
-                    "--", binary ctx, "run", "--network", "private", "--dryrun"])
+                    "--", binary ctx, "run", "--network-private", "--dryrun"])
                    {cwd = Just (project ctx)})
           dry `shouldContain` "'--ro-bind-data' '<dns-fd>' '/etc/resolv.conf'"
     createDirectory sparseEtc
@@ -1095,7 +1203,7 @@ spec = describe "workcell CLI" $ do
 
   it "preserves localtime through hidden intermediate symlinks" $ \ctx -> do
     let sparseEtc = root ctx </> "sparse etc"
-        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
+        flags = "--network-host" : ["--share-processes" | not (privateProc ctx)]
         outer = ["--ro-bind", "/", "/", "--proc", "/proc",
                  "--bind", project ctx, project ctx,
                  "--ro-bind", sparseEtc, "/etc", "--tmpfs", "/run",
@@ -1137,7 +1245,7 @@ spec = describe "workcell CLI" $ do
 
   it "restores enclosing visibility only with share-filesystem" $ \ctx -> do
     let fixture = root ctx </> "outside"
-        flags = "--share-network" : ["--share-processes" | not (privateProc ctx)]
+        flags = "--network-host" : ["--share-processes" | not (privateProc ctx)]
         outer = ["--ro-bind", "/", "/", "--proc", "/proc", "--tmpfs", "/opt",
                  "--ro-bind", fixture, "/opt/host-marker", "--", binary ctx, "run"]
     writeFile fixture "host data"
@@ -1280,10 +1388,10 @@ withRunningSessionHandle :: Context -> [String] -> (String -> ProcessHandle -> I
 withRunningSessionHandle ctx extra action = do
   environment <- sessionEnvironment ctx
   existing <- lines <$> (successful =<< sessionInvoke ctx ["list"])
-  let args = (if "--network" `elem` extra then [] else ["--network", "host"]) ++
-        ["--share-processes" | not (privateProc ctx) && "--share-processes" `notElem` extra] ++
-        ["-H", root ctx </> "session-home"] ++ extra ++
-        ["--", "/bin/sh", "-c", "touch entry-home-marker \"$HOME/entry-home-marker\"; exec sleep 30"]
+  let args = ["--network-host" | not (hasNetworkOption extra)] ++
+             ["--share-processes" | not (privateProc ctx) && "--share-processes" `notElem` extra] ++
+             ["-H", root ctx </> "session-home"] ++ extra ++
+             ["--", "/bin/sh", "-c", "touch entry-home-marker \"$HOME/entry-home-marker\"; exec sleep 30"]
   bracket (createProcess $ (proc (binary ctx) ("run" : args))
     {cwd = Just (project ctx), env = Just environment, std_out = NoStream})
     (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $ \(_, _, _, handle) -> do

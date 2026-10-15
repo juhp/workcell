@@ -29,8 +29,8 @@ workcell run -e LANG -e MY_VAR=hello -- env
 workcell run --dryrun -- ghc --version
 workcell run --share-processes -- ghc --version # fallback for restricted containers
 workcell run --share-filesystem -- ls /var/log # expose enclosing filesystem read-only
-workcell run --network none -- ghc --version   # offline, separate loopback network
-workcell run --share-network -- curl localhost:8000 # share enclosing network
+workcell run --network-none -- ghc --version   # offline, separate loopback network
+workcell run --network-host -- curl localhost:8000 # share enclosing network
 workcell run -v /path/to/data:/opt/data:ro -- ls /opt/data
 ```
 
@@ -65,7 +65,7 @@ the session's mounts instead. This namespace root maps to the invoking host
 account and does not grant host-root privileges. `--root` is an option of `enter`
 and also works with an explicit command or `--dryrun`.
 Shared process or network namespaces are left unchanged. Session operations cannot be
-combined with launch options such as `--home`, `--volume`, or `--network`.
+combined with launch options such as `--home`, `--volume`, or the network flags.
 When both input and output are terminals, entry allocates a new terminal inside
 the session using `systemd-pty-forward` or `script` (from util-linux).
 This lets terminal applications and shell job control work with the session's
@@ -77,7 +77,9 @@ When no absolute runtime directory is configured, workcell uses
 that variable is also unset or relative, with the same namespace subdirectory.
 Session directories are mode 0700 and records are mode 0600; records contain
 launch metadata but no environment values. Launch supervision also requires a
-writable enclosing temporary directory.
+writable enclosing temporary directory. Private-network readiness files use an
+existing absolute `$XDG_RUNTIME_DIR`, or `/tmp` as a fallback, so pasta does not
+need to write under a home-based `TMPDIR`.
 
 Listing and entry validate the PID, process start time, boot ID, and namespace
 identity. Normal exit and termination remove the record; an uncatchable stop
@@ -241,23 +243,29 @@ Individual file mounts follow in-place edits but not file replacements; copies
 are snapshots. Private networking's generated resolver remains a launch-time
 snapshot of search/domain and options settings.
 
-Networking defaults to `--network private`. Each workcell gets its own network
-namespace with outbound connectivity provided by a separate pasta process.
-Automatic TCP and UDP forwarding is disabled in both directions, and the special
-host loopback/gateway mappings are disabled. Workcell does not join or modify
-Podman's networking namespaces or configuration.
+By default, networking tries a private network through pasta, with a separate
+network namespace and outbound connectivity. If preflight fails, workcell warns
+and uses the enclosing host network instead. Explicit `--network-private`
+requires private setup to succeed.
+Automatic TCP and UDP forwarding is disabled in both directions in private mode,
+and the special host loopback/gateway mappings are disabled. Workcell does not
+join or modify Podman's networking namespaces or configuration.
 
-Choose a mode explicitly with `--network MODE`:
+Choose a mode with one of these mutually exclusive flags:
 
-| Mode | Connectivity |
+| Flag | Connectivity |
 | --- | --- |
-| `private` (default) | Outbound networking through pasta; separate localhost. |
-| `none` | Private loopback only; no external connectivity; pasta not required. |
-| `host` | Share the enclosing network, including its localhost services. |
+| (none) | Try private networking; warn and use host networking if preflight fails. |
+| `--network-private` | Outbound networking through pasta; separate localhost. |
+| `--network-host` | Share the enclosing network, including its localhost services. |
+| `--network-none` | Private loopback only; no external connectivity; pasta not required. |
 
-`--share-network` is an alias for `--network host`; it cannot be combined with
-`--network`. Network mode is independent of `--share-processes` and
-`--share-filesystem`.
+Network mode is independent of `--share-processes` and `--share-filesystem`.
+Fallback happens only during preflight, before the requested command starts.
+The session list records the selected mode (`private` or `host`). Once the
+command starts, failures are returned without retrying it. Default dry runs show
+the private-network plan and note possible host fallback without probing networking.
+Explicit network flags disable fallback.
 
 In private mode, workcell supplies a read-only `/etc/resolv.conf` using pasta's
 DNS forwarder at `169.254.1.1`, retaining the enclosing resolver's search/domain
@@ -269,7 +277,8 @@ then releases the command. Workcell supervises both processes, returns the
 command's exit status, and stops the sandbox if the helper exits unexpectedly.
 Both processes are cleaned up when the command exits or workcell is terminated.
 
-Pasta diagnostics go to a separate owner-readable log for each run under
+Workcell captures pasta diagnostics through a pipe and writes a separate
+owner-readable log for each run under
 `$XDG_STATE_HOME/workcell/logs`, or `~/.local/state/workcell/logs` when that
 variable is unset or not absolute. This location uses the enclosing environment,
 before workcell isolates the home directory. When diagnostics are present, startup
@@ -282,10 +291,11 @@ errors; it keeps helper diagnostics from interrupting interactive programs.
 Private mode needs pasta on `PATH`, an accessible `/dev/net/tun`, a configured
 nameserver in `/etc/resolv.conf`, and permission to create the required
 namespaces. Workcell checks network setup before creating a persistent home or
-running your command. It fails rather than falling back to host networking.
+running your command. Explicit `--network-private` fails if setup is unavailable;
+the default behavior falls back to host networking.
 An enclosing workcell's minimal `/dev` hides `/dev/net/tun`, so nested private
 networking needs that device exposed by the enclosing sandbox; alternatively,
-use `--share-network` to use the enclosing workcell's network.
+use `--network-host` to use the enclosing workcell's network.
 
 Private networking separates localhost; it does not block every service reachable
 through host or LAN addresses. File-mounted Unix sockets are governed by filesystem
@@ -341,8 +351,8 @@ Run the tasty-bench startup benchmarks with Cabal:
 cabal bench bench --benchmark-options='--timeout 5s'
 ```
 
-The benchmarks measure wall-clock time for `--dryrun` and launching `/bin/true`,
-including process startup and cleanup. Both use `--network host` so pasta is not
-required. The live benchmark is skipped with a diagnostic if sandbox startup is
-unavailable. Cabal supplies the built executable; set `WORKCELL` to an absolute
+The benchmarks measure wall-clock time for `--dryrun` and launching `true`,
+including process startup and cleanup. The host and dry-run benchmarks use
+`--network-host` so pasta is not required. Each live benchmark is skipped with a
+diagnostic if its network mode is unavailable. Cabal supplies the built executable; set `WORKCELL` to an absolute
 path to benchmark another binary.
