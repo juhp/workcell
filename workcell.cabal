@@ -31,9 +31,10 @@ source-repository head
 
 executable workcell
   main-is:             Main.hs
-  other-modules:       Workcell
-                       Session
+  other-modules:       Enter
+                       Run
                        Network
+                       Session
                        Paths_workcell
   autogen-modules:     Paths_workcell
   hs-source-dirs:      src

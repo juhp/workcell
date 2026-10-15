@@ -9,26 +9,31 @@ and a writable project. Requires Linux and bubblewrap, plus pasta (from the
 ```sh
 cabal build --offline
 cabal run workcell -- --help
-cabal run workcell -- -p . -- ghc --version
+cabal run workcell -- run -p . -- ghc --version
 ```
+
+Use `workcell run` to start a session, `workcell list` to discover active
+sessions, and `workcell enter SESSION` to join one. Each subcommand has its
+own `--help`. Launch options follow `run`; the former `--list` and `--enter`
+options are replaced by subcommands.
 
 After installing with `cabal install`:
 
 ```sh
-workcell                                  # current project, interactive Bash
-workcell -p /path/to/project -- git status
-workcell -H /path/to/sandbox-home          # persistent home, created if missing
-workcell -v ~/.gitconfig -- git status    # read-only file at its original path
-workcell -v ~/.cabal:rw -- cabal build --offline
-workcell -v ~/.config/cabal -v ~/.cache/cabal:rw -v ~/.local/state/cabal:rw -- cabal build --offline
-workcell -v /path/to/data:/tmp/data:ro -- ls /tmp/data
-workcell -e LANG -e MY_VAR=hello -- env
-workcell --dryrun -- ghc --version
-workcell --share-processes -- ghc --version # fallback for restricted containers
-workcell --share-filesystem -- ls /var/log # expose enclosing filesystem read-only
-workcell --network none -- ghc --version   # offline, separate loopback network
-workcell --share-network -- curl localhost:8000 # share enclosing network
-workcell -v /path/to/data:/opt/data:ro -- ls /opt/data
+workcell run                              # current project, interactive Bash
+workcell run -p /path/to/project -- git status
+workcell run -H /path/to/sandbox-home          # persistent home, created if missing
+workcell run -v ~/.gitconfig -- git status    # read-only file at its original path
+workcell run -v ~/.cabal:rw -- cabal build --offline
+workcell run -v ~/.config/cabal -v ~/.cache/cabal:rw -v ~/.local/state/cabal:rw -- cabal build --offline
+workcell run -v /path/to/data:/tmp/data:ro -- ls /tmp/data
+workcell run -e LANG -e MY_VAR=hello -- env
+workcell run --dryrun -- ghc --version
+workcell run --share-processes -- ghc --version # fallback for restricted containers
+workcell run --share-filesystem -- ls /var/log # expose enclosing filesystem read-only
+workcell run --network none -- ghc --version   # offline, separate loopback network
+workcell run --share-network -- curl localhost:8000 # share enclosing network
+workcell run -v /path/to/data:/opt/data:ro -- ls /opt/data
 ```
 
 ## Entering an active workcell
@@ -36,11 +41,11 @@ workcell -v /path/to/data:/opt/data:ro -- ls /opt/data
 From another terminal in the same enclosing environment:
 
 ```sh
-workcell --list
-workcell --enter s123456               # use an ID from --list; starts Bash
-workcell --enter s123456 -- git status
-workcell --enter s123456 --root        # root inside the workcell
-workcell --enter s123456 --dryrun
+workcell list
+workcell enter s123456               # use an ID from workcell list; starts Bash
+workcell enter s123456 -- git status
+workcell enter s123456 --root        # root inside the workcell
+workcell enter s123456 --dryrun
 ```
 
 Entry requires `nsenter` (from util-linux) and runs without sudo. It starts an
@@ -49,9 +54,9 @@ initial command environment, and isolated process/network namespaces.
 Entry also joins the initial command's user namespace, preserving the invoking
 user's UID/GID rather than leaving the command as root in bubblewrap's setup
 namespace.
-Use `--enter ID --root` to run as UID/GID 0 in the user namespace that owns
+Use `workcell enter ID --root` to run as UID/GID 0 in the user namespace that owns
 the session's mounts instead. This namespace root maps to the invoking host
-account and does not grant host-root privileges. `--root` requires `--enter`
+account and does not grant host-root privileges. `--root` is an option of `enter`
 and also works with an explicit command or `--dryrun`.
 Shared process or network namespaces are left unchanged. Session operations cannot be
 combined with launch options such as `--home`, `--volume`, or `--network`.
@@ -126,7 +131,7 @@ If `WAYLAND_DISPLAY` is unset, it uses `wayland-0`; absolute display paths are
 also supported. Explicit `-e` settings override these defaults.
 
 ```sh
-workcell --wayland -- gtk4-demo
+workcell run --wayland -- gtk4-demo
 ```
 
 Audio, GPU devices, and the desktop D-Bus session are not exposed yet
@@ -145,7 +150,7 @@ The order of the flags does not affect this preference; use `-e GDK_BACKEND=...`
 to choose another order or backend.
 
 ```sh
-workcell --x11 -- xterm
+workcell run --x11 -- xterm
 ```
 
 X11 access permits broad interaction with other X clients, including input and
@@ -160,7 +165,7 @@ are unsupported. Explicit `-e` settings can override the forwarded address.
 It can be combined with `--wayland` and `--x11`.
 
 ```sh
-workcell --wayland --dbus -- gtk4-demo
+workcell run --wayland --dbus -- gtk4-demo
 ```
 
 This shares the session bus directly, without filtering services or methods.
@@ -177,7 +182,7 @@ fi
 ```
 
 With the default empty home, mount your Bash configuration explicitly (for
-example, `workcell -v ~/.bashrc`) or use a persistent home with `--home`.
+example, `workcell run -v ~/.bashrc`) or use a persistent home with `--home`.
 
 Options precede the command. Use `--` to separate command arguments; those
 arguments are passed directly without shell expansion. Without a command,
@@ -322,7 +327,7 @@ environment lacks the helper, TUN device, or working namespace support.
 Session checks cover entry without sudo, environment and namespace preservation,
 concurrent sessions, stale records, PID namespace scoping, and cleanup.
 To check actual internet access and DNS resolution on the host, run
-`workcell -- curl --max-time 15 -I https://example.com`.
+`workcell run -- curl --max-time 15 -I https://example.com`.
 
 Run the tasty-bench startup benchmarks with Cabal:
 

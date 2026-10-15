@@ -11,7 +11,7 @@ import Test.Tasty.Bench
 main :: IO ()
 main = do
   executable <- fromMaybe "workcell" <$> lookupEnv "WORKCELL"
-  let launch = ["--network", "host", "--", "/bin/true"]
+  let launch = ["run", "--network", "host", "--", "/bin/true"]
       run args = do
         (code, out, err) <- readProcessWithExitCode executable args ""
         case code of
@@ -25,6 +25,6 @@ main = do
   defaultMain
     [ localOption WallTime $
       bgroup "workcell" $
-      bench "dryrun" (nfIO $ run ["--network", "host", "--dryrun", "--", "/bin/true"]) :
+      bench "dryrun" (nfIO $ run ["run", "--network", "host", "--dryrun", "--", "/bin/true"]) :
       [bench "run true" $ nfIO $ run launch | code == ExitSuccess]
     ]

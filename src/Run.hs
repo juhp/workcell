@@ -1,13 +1,12 @@
 -- SPDX-License-Identifier: BSD-3-Clause
-module Workcell (Options(..), runWorkcell) where
+module Run (Options(..), runWorkcell) where
 
-import Control.Exception (bracket, throwTo)
-import Control.Concurrent (myThreadId)
-import Control.Monad (forM, unless, void, when)
+import Control.Exception (bracket)
+import Control.Monad (forM, unless, when)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
 import SimpleCmd (cmdFull, needProgram)
@@ -15,15 +14,14 @@ import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
    doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
-import System.Exit (ExitCode(..), exitWith)
-import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
+import System.Exit (exitWith)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
 import System.Posix.IO (OpenMode(..), closeFd)
 
 import Network (NetworkMode(..), networkMode, pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork, openSimpleFd)
-import Session (SessionDetails(..), withSession, listSessions, enterSession)
+import Session (SessionDetails(..), withSession)
 
 data Options = Options
   { projectOption :: Maybe FilePath
@@ -38,9 +36,6 @@ data Options = Options
   , shareFilesystem :: Bool
   , networkOption :: Maybe String
   , shareNetwork :: Bool
-  , listOption :: Bool
-  , enterOption :: Maybe String
-  , rootOption :: Bool
   , command :: [String]
   }
 
@@ -60,33 +55,7 @@ data Launch = Launch
   }
 
 runWorkcell :: Options -> IO ()
-runWorkcell opts
-  | rootOption opts && isNothing (enterOption opts) = invalid "--root requires --enter"
-  | listOption opts || isJust (enterOption opts) = do
-      when (listOption opts && isJust (enterOption opts)) $
-        invalid "--list and --enter cannot be combined"
-      when (isJust (projectOption opts) || isJust (homeOption opts) ||
-            not (null $ volumeOptions opts) || not (null $ environmentOptions opts) ||
-            waylandOption opts || x11Option opts || dbusOption opts || shareProcesses opts || shareFilesystem opts ||
-            isJust (networkOption opts) || shareNetwork opts) $
-        invalid "session operations cannot be combined with launch options"
-      if listOption opts
-        then do
-          when (dryRun opts || not (null $ command opts)) $ invalid "--list does not accept --dryrun or a command"
-          listSessions
-        else maybe (invalid "missing session ID")
-          (\ident -> withTermination $ enterSession ident (dryRun opts) (rootOption opts) (command opts)) (enterOption opts)
-  | otherwise = withTermination $ launchWorkcell opts
-
--- Turn termination into an exception so session/helper brackets can clean up.
-withTermination :: IO a -> IO a
-withTermination action = do
-  thread <- myThreadId
-  bracket (installHandler sigTERM (CatchOnce $ throwTo thread $ ExitFailure 143) Nothing)
-    (\previous -> void (installHandler sigTERM previous Nothing)) $ const action
-
-launchWorkcell :: Options -> IO ()
-launchWorkcell opts = do
+runWorkcell opts = do
   launch <- prepare opts
   if dryRun opts
     then if selectedNetwork launch == PrivateNetwork || not (null $ copiedSystemFiles launch)
