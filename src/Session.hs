@@ -23,11 +23,12 @@ import Data.Char (isDigit, isAsciiLower, isAsciiUpper)
 import Data.List (intercalate, sort, transpose)
 import Data.Maybe (catMaybes, fromMaybe)
 import GHC.Generics (Generic)
+import SimpleCmd (warning)
 import System.Directory
 import System.Environment (lookupEnv)
 import System.FilePath ((</>), isAbsolute, takeFileName)
 import System.IO
-  (Handle, hClose, hFlush, hIsEOF, hIsTerminalDevice, hPutStr, hPutStrLn,
+  (Handle, hClose, hFlush, hIsTerminalDevice, isEOF, hPutStr, hPutStrLn,
    openBinaryTempFile, stderr, stdin, stdout)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files
@@ -262,7 +263,7 @@ chooseSession records = do
     prompt = do
       hPutStr stderr $ "Select a workcell [1-" ++ show count ++ "] (Enter to cancel): "
       hFlush stderr
-      eof <- hIsEOF stdin
+      eof <- isEOF
       when eof $ invalid "session selection cancelled"
       answer <- getLine
       when (null $ words answer) $ invalid "session selection cancelled"
@@ -272,5 +273,5 @@ chooseSession records = do
             selected:_ -> pure selected
             [] -> invalid "invalid session selection"
         _ -> do
-          hPutStrLn stderr $ "Please enter a number from 1 to " ++ show count ++ "."
+          warning $ "Please enter a number from 1 to " ++ show count ++ "."
           prompt

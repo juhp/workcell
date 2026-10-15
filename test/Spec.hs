@@ -4,7 +4,7 @@ module Main (main) where
 
 import Control.Exception (bracket, throwIO, throwTo)
 import Control.Concurrent (forkFinally, myThreadId, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM_, unless, void, when, (>=>))
 import Data.Aeson (Value(..), eitherDecodeStrict', encode)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
@@ -676,7 +676,7 @@ spec = describe "workcell CLI" $ do
     let stateEnv = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
     _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network", "private", "--", "/bin/true"]
     retained <- pastaLogs ctx
-    forM_ retained $ \path -> getFileSize path >>= (`shouldSatisfy` (> 0))
+    forM_ retained $ getFileSize >=> (`shouldSatisfy` (> 0))
     invocation <- fakeHelperCommand ctx "echo preflight-failure >&2\nexit 42" ["/bin/true"]
     (code, _, err) <- invoke ctx Nothing (env invocation)
       ["--network", "private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
