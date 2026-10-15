@@ -24,7 +24,7 @@ main =
     , Subcommand "enter" "Enter an active workcell without sudo" $
       enterSession
       <$> switchLongWith "dryrun" "Print the entry command without entering"
-      <*> strArg "SESSION"
+      <*> optional (strArg "SESSION")
       <*> switchLongWith "root" "Enter as root inside the workcell"
       <*> many (strArg "COMMAND ARG...")
     , Subcommand "run" "Run a workcell bwrap session" $

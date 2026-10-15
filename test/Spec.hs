@@ -136,18 +136,37 @@ spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
   it "enters no unknown session" $ \ctx -> do
     sessionInvoke ctx ["list"] >>= successful >>= (`shouldBe` "")
-    (code1, _, _) <- sessionInvoke ctx ["enter"]
+    (code1, _, emptyError) <- sessionInvoke ctx ["enter"]
     code1 `shouldNotBe` ExitSuccess
+    emptyError `shouldContain` "no active sessions"
+    emptyError `shouldContain` "workcell list"
     (code2, _, err) <- sessionInvoke ctx ["enter", "s123"]
     code2 `shouldNotBe` ExitSuccess
     err `shouldContain` "unknown or expired"
     err `shouldContain` "workcell list"
     doesDirectoryExist (project ctx </> "unwanted") >>= (`shouldBe` False)
 
+  it "automatically enters the only active session, including root and dry-run modes" $ \ctx -> do
+    withRunningSession ctx [] $ \ident -> do
+      sessionInvoke ctx ["enter"] >>= successful >>= (`shouldBe` "")
+      sessionInvoke ctx ["enter", "--root"] >>= successful >>= (`shouldBe` "")
+      forM_ [[], ["--root"]] $ \flags -> do
+        explicit <- successful =<< sessionInvoke ctx (["enter", ident, "--dryrun"] ++ flags)
+        automatic <- successful =<< sessionInvoke ctx (["enter", "--dryrun"] ++ flags)
+        automatic `shouldBe` explicit
+
   it "tracks concurrent sessions and removes records on termination" $ \ctx -> do
     withRunningSession ctx [] $ \first -> do
       withRunningSession ctx [] $ \second -> do
         first `shouldNotBe` second
+        listing <- successful =<< sessionInvoke ctx ["list"]
+        forM_ [[], ["--dryrun"], ["--root"]] $ \flags -> do
+          (code, output, err) <- sessionInvoke ctx ("enter" : flags)
+          code `shouldNotBe` ExitSuccess
+          output `shouldBe` listing
+          err `shouldContain` "multiple active sessions; specify a session ID"
+        preview <- successful =<< sessionInvoke ctx ["enter", first, "--dryrun"]
+        preview `shouldContain` "nsenter"
         output <- successful =<< sessionInvoke ctx ["list"]
         output `shouldContain` first
         output `shouldContain` second

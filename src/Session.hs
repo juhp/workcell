@@ -208,8 +208,10 @@ quote :: String -> String
 quote value = "'" ++ concatMap (\c -> if c == '\'' then "'\\''" else [c]) value ++ "'"
 
 listSessions :: IO ()
-listSessions = do
-  records <- sessions
+listSessions = sessions >>= printSessions
+
+printSessions :: [Session] -> IO ()
+printSessions records =
   unless (null records) $ do
     let rows = ["ID", "PROJECT", "NETWORK", "COMMAND"] : map row records
         widths = map (maximum . map length) (transpose $ map (take 3) rows) ++ [0]
@@ -221,8 +223,16 @@ listSessions = do
       in [sessionID record, fromMaybe "-" $ sessionProject details,
          sessionNetwork details, unwords $ map quote $ sessionCommand details]
 
-findSession :: String -> IO Session
-findSession ident = do
+findSession :: Maybe String -> IO Session
+findSession Nothing = do
+  records <- sessions
+  case records of
+    [found] -> pure found
+    [] -> invalid "no active sessions in this PID namespace (use workcell list)"
+    _ -> do
+      printSessions records
+      invalid "multiple active sessions; specify a session ID"
+findSession (Just ident) = do
   unless (validID ident) $ invalid "invalid session ID (use workcell list)"
   matches <- filter ((== ident) . sessionID) <$> sessions
   case matches of

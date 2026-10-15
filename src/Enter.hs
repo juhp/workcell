@@ -40,7 +40,7 @@ ownerNamespace :: Fd -> IO Fd
 ownerNamespace (Fd fd) = Fd <$> throwErrnoIfMinus1 "mount namespace owner"
   (namespaceIoctl fd getOwnerNamespace 0)
 
-enterSession :: Bool -> String -> Bool -> [String] -> IO ()
+enterSession :: Bool -> Maybe String -> Bool -> [String] -> IO ()
 enterSession dry ident root command = do
   record <- findSession ident
   interactive <- (&&) <$> hIsTerminalDevice stdin <*> hIsTerminalDevice stdout

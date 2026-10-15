@@ -42,11 +42,17 @@ From another terminal in the same enclosing environment:
 
 ```sh
 workcell list
+workcell enter                       # use the only active session; starts Bash
 workcell enter s123456               # use an ID from workcell list; starts Bash
 workcell enter s123456 -- git status
 workcell enter s123456 --root        # root inside the workcell
 workcell enter s123456 --dryrun
 ```
+
+The session ID is optional when exactly one active session is visible. With
+multiple sessions, `enter` lists the active workcells and returns an error;
+supply an ID to choose one. With no active sessions, it reports an error. `--root` and `--dryrun` also
+work without an ID. Supply an explicit ID when passing a command.
 
 Entry requires `nsenter` (from util-linux) and runs without sudo. It starts an
 additional command using the session's filesystem root, working directory,
