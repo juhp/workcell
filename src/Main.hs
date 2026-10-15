@@ -26,7 +26,7 @@ main =
       <$> switchLongWith "dryrun" "Print the entry command without entering"
       <*> optional (strArg "SESSION")
       <*> switchLongWith "root" "Enter as root inside the workcell"
-      <*> many (strArg "COMMAND ARG...")
+      <*> many (strArg "[--] COMMAND ARG...")
     , Subcommand "run" "Run a workcell bwrap session" $
       runWorkcell <$> options
     ]
@@ -56,4 +56,4 @@ options = Options
   <*> switchLongWith "share-filesystem" "Expose the enclosing filesystem read-only, retaining isolated home"
   <*> optional (strOptionLongWith "network" "MODE" "Networking: private (default, requires pasta), none, or host")
   <*> switchLongWith "share-network" "Share the enclosing network (alias for --network host)"
-  <*> many (strArg "COMMAND ARG...")
+  <*> many (strArg "[--] COMMAND ARG...")
