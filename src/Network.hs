@@ -26,7 +26,7 @@ import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types (CInt(..), CULong(..))
 import SimpleCmd (cmdFull)
 import System.Directory
-  (createDirectoryIfMissing, doesFileExist, doesPathExist, findExecutable, getHomeDirectory, getTemporaryDirectory,
+  (createDirectoryIfMissing, doesFileExist, doesPathExist, findExecutable, getFileSize, getHomeDirectory, getTemporaryDirectory,
    removeFile, removePathForcibly)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
@@ -121,14 +121,14 @@ foreign import capi unsafe "linux/nsfs.h value NS_GET_USERNS"
 runPrivateNetwork :: [String] -> [String] -> FilePath -> IO ExitCode
 runPrivateNetwork = runLoggedNetwork False
 
--- Successful preflight logs are disposable; real runs and failures retain logs.
+-- Successful preflight logs are disposable; other logs are kept only if nonempty.
 runLoggedNetwork :: Bool -> [String] -> [String] -> FilePath -> IO ExitCode
 runLoggedNetwork discardSuccess extraPastaArgs args resolverDestination =
   withPastaLog discardSuccess $ \logHandle ->
     runNetwork (\_ action -> action) logHandle extraPastaArgs args resolverDestination
 
 withPastaLog :: Bool -> (Handle -> IO ExitCode) -> IO ExitCode
-withPastaLog discardSuccess action = bracket acquire (hClose . snd) $ \(path, handle) -> do
+withPastaLog discardSuccess action = bracket acquire release $ \(path, handle) -> do
   result <- catchIOError (do
     code <- action handle
     when (discardSuccess && code /= ExitSuccess) $
@@ -136,11 +136,20 @@ withPastaLog discardSuccess action = bracket acquire (hClose . snd) $ \(path, ha
     pure code) $ \err -> do
     -- Children have been stopped by their brackets before reading the log.
     tailText <- catchIOError (diagnosticTail path) $ const $ pure "(unable to read pasta log)\n"
-    invalid $ ioeGetErrorString err ++ "\nPasta log: " ++ path ++
-      (if null tailText then "" else "\nRecent pasta diagnostics:\n" ++ tailText)
+    invalid $ ioeGetErrorString err ++
+      (if null tailText then "" else "\nPasta log: " ++ path ++
+        "\nRecent pasta diagnostics:\n" ++ tailText)
   when discardSuccess $ removeFile path
   pure result
   where
+    -- runNetwork's child brackets have stopped all writers before release,
+    -- including when the supervisor is terminated or setup fails.
+    release (path, handle) = do
+      hClose handle
+      catchIOError (do
+        size <- getFileSize path
+        when (size == 0) $ removeFile path) $ \err ->
+        unless (isDoesNotExistError err) $ ioError err
     acquire = catchIOError openLog $ \err ->
       invalid $ "cannot open pasta log: " ++ ioeGetErrorString err
     openLog = do

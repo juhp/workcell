@@ -2,8 +2,8 @@
 -- SPDX-License-Identifier: LGPL-2.1-or-later
 module Main (main) where
 
-import Control.Exception (bracket, throwIO)
-import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, takeMVar, threadDelay)
+import Control.Exception (bracket, throwIO, throwTo)
+import Control.Concurrent (forkFinally, myThreadId, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Monad (forM_, unless, void, when)
 import Data.Aeson (Value(..), eitherDecodeStrict', encode)
 import qualified Data.Aeson.KeyMap as KM
@@ -23,7 +23,7 @@ import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Terminal (openPseudoTerminal)
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
-import System.Posix.Signals (signalProcess, sigKILL)
+import System.Posix.Signals (Handler(CatchOnce), installHandler, signalProcess, sigKILL, sigTERM)
 import System.Process hiding (shell)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -49,9 +49,16 @@ main = do
       WorkcellNetwork.runTrackedPrivateNetwork
         (WorkcellSession.withSession $ WorkcellSession.SessionDetails Nothing ["sleep", "30"] "private" False)
         ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
-    "--test-loopback-network":bwrapArgs ->
+    "--test-loopback-network":bwrapArgs -> withTestTermination $
       WorkcellNetwork.runPrivateNetwork ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
     _ -> testMain
+
+-- Match the CLI's SIGTERM handling so the helper exercises bracket cleanup.
+withTestTermination :: IO a -> IO a
+withTestTermination action = do
+  thread <- myThreadId
+  bracket (installHandler sigTERM (CatchOnce $ throwTo thread $ ExitFailure 143) Nothing)
+    (\previous -> void (installHandler sigTERM previous Nothing)) $ const action
 
 testMain :: IO ()
 testMain = do
@@ -537,6 +544,41 @@ spec = describe "workcell CLI" $ do
     length logs `shouldBe` 2
     forM_ logs $ \path -> readFile path `shouldReturn` "helper-warning\n"
 
+  it "removes empty pasta logs after command exit and supervisor termination" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    let helper = unlines
+          ["while [ \"$1\" != --pid ]; do shift; done", "echo $$ > \"$2\"",
+           "exec /bin/sleep 30"]
+    invocation <- fakeHelperCommand ctx helper
+      ["/bin/sh", "-c", "touch command-ran; exit \"$EXIT_CODE\""]
+    environment <- getEnvironment
+    forM_ [0, 23 :: Int] $ \status -> do
+      let envs = setVariables [("EXIT_CODE", show status)] $ fromMaybe environment (env invocation)
+      (code, _, err) <- capture (invocation {env = Just envs})
+      code `shouldBe` (if status == 0 then ExitSuccess else ExitFailure status)
+      err `shouldBe` ""
+      pastaLogs ctx `shouldReturn` []
+    waiting <- loopbackCommand ctx
+      ["/bin/sh", "-c", "touch network-ready; exec /bin/sleep 30"]
+    bracket (createProcess (waiting {env = env invocation}))
+      (\(_, _, _, handle) -> terminateProcess handle >> waitForProcess handle >> pure ()) $
+      \(_, _, _, handle) -> do
+        waitUntil (doesFileExist $ project ctx </> "network-ready")
+        logs <- pastaLogs ctx
+        length logs `shouldBe` 1
+        terminateProcess handle
+        _ <- waitForProcess handle
+        pastaLogs ctx `shouldReturn` []
+
+  it "removes empty pasta logs on setup failure without reporting a missing log" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    invocation <- fakeHelperCommand ctx "exit 42" ["/bin/true"]
+    (code, _, err) <- capture invocation
+    code `shouldNotBe` ExitSuccess
+    err `shouldContain` "pasta exited during network setup"
+    err `shouldNotContain` "Pasta log:"
+    pastaLogs ctx `shouldReturn` []
+
   it "reports retained diagnostics when the helper exits during a command" $ \ctx -> do
     unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
     let helper = unlines
@@ -591,14 +633,15 @@ spec = describe "workcell CLI" $ do
     environment <- getEnvironment
     let stateEnv = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
     _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network", "private", "--", "/bin/true"]
-    pastaLogs ctx >>= (\logs -> length logs `shouldBe` 1)
+    retained <- pastaLogs ctx
+    forM_ retained $ \path -> getFileSize path >>= (`shouldSatisfy` (> 0))
     invocation <- fakeHelperCommand ctx "echo preflight-failure >&2\nexit 42" ["/bin/true"]
     (code, _, err) <- invoke ctx Nothing (env invocation)
       ["--network", "private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
     code `shouldNotBe` ExitSuccess
     err `shouldContain` "preflight-failure"
     err `shouldContain` "Pasta log:"
-    pastaLogs ctx >>= (\logs -> length logs `shouldBe` 2)
+    pastaLogs ctx >>= (\logs -> length logs `shouldBe` length retained + 1)
     doesPathExist (root ctx </> "uncreated home") `shouldReturn` False
 
   it "can explicitly share the enclosing PID namespace" $ \ctx -> do
