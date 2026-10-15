@@ -1,5 +1,3 @@
-WIP
-
 # workcell notes
 
 Run installed system tools with a read-only filesystem, an isolated home,
