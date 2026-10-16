@@ -97,9 +97,13 @@ original command. For manual host-root entry, use a host-visible command PID:
 sudo nsenter --target PID --mount --net --pid --root --wd -- /bin/bash
 ```
 
-`-p/--project` defaults to the current directory. The project is mounted writable
-at its original absolute path (resolved through symlinks); commands start there.
+`-p/--project DIR[:ro|rw|O]` defaults to the current directory.
+The project is mounted (writable by default) at its original absolute path
+(resolved through symlinks); commands start there.
 Edits and deletions affect the original project immediately.
+Use `-p DIR:ro` for read-only project access; commands still start in the project,
+but cannot modify its files or create build outputs there. `-p DIR:rw` explicitly
+selects the default writable access.
 Use `-p DIR:O` for a temporary writable overlay instead: commands start at the
 same canonical project path, but edits, deletions, and new files are discarded
 when the session ends. The source project stays unchanged.

@@ -852,6 +852,37 @@ spec = describe "workcell CLI" $ do
     readFile (supplied </> "home-write") `shouldReturn` "saved"
     shellHome ctx supplied "[ \"$(cat \"$HOME/home-write\")\" = saved ]"
 
+  it "enforces read-only project access and supports explicit read/write access" $ \ctx -> do
+    let link = root ctx </> "project link"
+    createDirectoryLink (project ctx) link
+    writeFile (project ctx </> "original") "original"
+    forM_ [[], ["--share-filesystem"]] $ \flags -> do
+      out <- success ctx $ flags ++ ["-p", link ++ ":ro", "--", "/bin/sh", "-ec", unlines
+        [ "pwd", "[ \"$(cat original)\" = original ]"
+        , "! (printf changed > original) 2>/dev/null"
+        , "! rm original 2>/dev/null; ! touch new 2>/dev/null"
+        , "printf writable > \"$HOME/home-write\""
+        ]]
+      out `shouldBe` project ctx ++ "\n"
+    readFile (project ctx </> "original") `shouldReturn` "original"
+    doesPathExist (project ctx </> "new") `shouldReturn` False
+    void $ success ctx ["-p", link ++ ":rw", "--", "/bin/sh", "-ec",
+                        "printf changed > original; touch new"]
+    readFile (project ctx </> "original") `shouldReturn` "changed"
+    doesPathExist (project ctx </> "new") `shouldReturn` True
+
+  it "validates and previews project access modes before creating persistent home" $ \ctx -> do
+    let supplied = root ctx </> "new home"
+    forM_ [("ro", "--ro-bind"), ("rw", "--bind")] $ \(access, flag) -> do
+      out <- success ctx ["--network-host", "-p", project ctx ++ ":" ++ access,
+                          "-H", supplied, "--dryrun"]
+      out `shouldContain` ("'" ++ flag ++ "' '" ++ project ctx ++ "' '" ++ project ctx ++ "'")
+      void $ failure ctx ["-p", home ctx ++ ":" ++ access, "-H", supplied, "--dryrun"]
+    forM_ [":ro", project ctx ++ ":invalid", project ctx ++ ":ro:rw"] $ \path -> do
+      err <- failure ctx ["-p", path, "-H", supplied, "--dryrun"]
+      err `shouldContain` "invalid project"
+    doesPathExist supplied `shouldReturn` False
+
   it "enforces read-only file volumes and allows explicit writes" $ \ctx -> do
     let src = root ctx </> "extra file"
         dest = "/tmp/extra file"

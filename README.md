@@ -40,21 +40,22 @@ The main way to use workcell is to start a bwrap session.
 `$ workcell run --help`
 
 ```
-Usage: workcell run [-p|--project DIR[:O]] [-H|--home DIR]
-                    [-v|--volume SOURCE[:DEST][:ro|rw|O]] [-e|--env KEY[=VALUE]]
-                    [--wayland] [--x11] [--dbus] [--dryrun] [--share-processes]
-                    [--share-filesystem]
+Usage: workcell run [-p|--project DIR[:(ro|rw|O)]] [-H|--home DIR]
+                    [-v|--volume SOURCE[:DEST][:(ro|rw|O)]]
+                    [-e|--env KEY[=VALUE]] [--wayland] [--x11] [--dbus]
+                    [--dryrun] [--share-processes] [--share-filesystem]
                     [--network-host | --network-none | --network-private]
                     [[--] COMMAND ARG...]
 
   Run a workcell bwrap session
 
 Available options:
-  -p,--project DIR[:O]     Writable project (:O for temporary overlay;
-                           default: current directory,
-                           excluding HOME and ancestors)
+  -p,--project DIR[:(ro|rw|O)]
+                           Project access (default: rw; :O for temporary
+                           overlay; directory defaults to cwd, excluding HOME
+                           and ancestors)
   -H,--home DIR            Persistent writable home (created if missing)
-  -v,--volume SOURCE[:DEST][:ro|rw|O]
+  -v,--volume SOURCE[:DEST][:(ro|rw|O)]
                            Extra mount (:O for temporary directory overlay;
                            default: same path, read-only)
   -e,--env KEY[=VALUE]     Set or pass through an environment variable
@@ -103,6 +104,7 @@ Available options:
 ```shellsession
 $ workcell run   # open a workcell shell on the cwd
 $ workcell run --project /path/to/project -- git status
+$ workcell run -p /path/to/project:ro -- git diff   # read-only project
 $ workcell run -p /path/to/project:O -- make   # discard project changes on exit
 $ workcell run --home /path/to/sandbox-home   # persistent home, created if missing
 $ workcell run -v ~/.gitconfig -- git status    # mount file ro

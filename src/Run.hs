@@ -10,7 +10,6 @@ import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.List.Extra (stripSuffix)
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
@@ -127,9 +126,10 @@ withSystemFiles ((index, path):rest) action =
 prepare :: Options -> IO Launch
 prepare opts = do
   let mode = fromMaybe PrivateNetwork $ networkOption opts
-  let (projectPath, projectMode) = case projectOption opts of
-        Just path | Just directory <- stripSuffix ":O" path -> (directory, OverlayMount)
-        path -> (fromMaybe "." path, ReadWriteMount)
+  (projectPath, projectMode) <-
+    case splitMountSpec ReadWriteMount (fromMaybe "." $ projectOption opts) of
+      ([path], access) | not (null path) -> pure (path, access)
+      _ -> invalid "invalid project (expected DIR[:ro|rw|O])"
   candidate <- existingDirectory "project" projectPath
   originalHome <- getHomeDirectory
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
@@ -422,15 +422,22 @@ resolveMount spec = do
   pure $ Mount srcPath dstPath mode
 
 parseMount :: String -> Either String (FilePath, Maybe FilePath, MountMode)
-parseMount spec = case splitColon spec of
-  [src] | valid src -> Right (src, Nothing, ReadOnlyMount)
-  [src, mode] | valid src, Just rw <- access mode -> Right (src, Nothing, rw)
-  [src, dst] | valid src && valid dst -> Right (src, Just dst, ReadOnlyMount)
-  [src, dst, mode] | valid src && valid dst, Just rw <- access mode ->
-    Right (src, Just dst, rw)
-  _ -> Left $ "invalid volume (expected SOURCE[:DEST][:ro|rw|O]): " ++ spec
+parseMount spec =
+  case splitMountSpec ReadOnlyMount spec of
+    ([src], access) | valid src -> Right (src, Nothing, access)
+    ([src, dst], access) | valid src && valid dst -> Right (src, Just dst, access)
+    _ -> Left $ "invalid volume (expected SOURCE[:DEST][:ro|rw|O]): " ++ spec
   where
     valid = not . null
+
+-- Both project and volume specifications accept the same trailing access mode.
+splitMountSpec :: MountMode -> String -> ([String], MountMode)
+splitMountSpec fallback spec =
+  case reverse parts of
+    mode:rest | not (null rest), Just value <- access mode -> (reverse rest, value)
+    _ -> (parts, fallback)
+  where
+    parts = splitColon spec
     access "ro" = Just ReadOnlyMount
     access "rw" = Just ReadWriteMount
     access "O" = Just OverlayMount
