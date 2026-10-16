@@ -870,6 +870,78 @@ spec = describe "workcell CLI" $ do
     volumeShell ctx (src ++ ":rw") "printf writable > \"$1/new\"" [src]
     readFile (src </> "new") `shouldReturn` "writable"
 
+  it "discards same-path and redirected directory overlay changes" $ \ctx -> do
+    requireOverlay ctx
+    let src = root ctx </> "overlay source"
+    createDirectory src
+    writeFile (src </> "original") "original"
+    writeFile (src </> "deleted") "keep"
+    forM_ [src, "/tmp/overlay destination"] $ \dest -> do
+      let volume = src ++ (if dest == src then "" else ":" ++ dest) ++ ":O"
+      volumeShell ctx volume (unlines
+        [ "[ \"$(cat \"$1/original\")\" = original ]"
+        , "[ -f \"$1/deleted\" ] && [ ! -e \"$1/new\" ]"
+        , "printf changed > \"$1/original\""
+        , "rm \"$1/deleted\"; printf created > \"$1/new\""
+        , "[ \"$(cat \"$1/original\")\" = changed ]"
+        , "[ ! -e \"$1/deleted\" ] && [ -f \"$1/new\" ]"
+        ]) [dest]
+      readFile (src </> "original") `shouldReturn` "original"
+      readFile (src </> "deleted") `shouldReturn` "keep"
+      doesPathExist (src </> "new") `shouldReturn` False
+      volumeShell ctx volume
+        "[ \"$(cat \"$1/original\")\" = original ] && [ -f \"$1/deleted\" ] && [ ! -e \"$1/new\" ]" [dest]
+
+  it "starts in a canonical project overlay and discards edits between sessions" $ \ctx -> do
+    requireOverlay ctx
+    let link = root ctx </> "project link"
+    createDirectoryLink (project ctx) link
+    writeFile (project ctx </> "original") "original"
+    writeFile (project ctx </> "deleted") "keep"
+    let args = ["-p", link ++ ":O", "--", "/bin/sh", "-ec"]
+    out <- success ctx $ args ++ [unlines
+      [ "pwd", "[ \"$(cat original)\" = original ]"
+      , "printf changed > original; rm deleted; touch new"
+      , "[ \"$(cat original)\" = changed ] && [ ! -e deleted ] && [ -f new ]"
+      ]]
+    out `shouldBe` project ctx ++ "\n"
+    readFile (project ctx </> "original") `shouldReturn` "original"
+    readFile (project ctx </> "deleted") `shouldReturn` "keep"
+    doesPathExist (project ctx </> "new") `shouldReturn` False
+    void $ success ctx $ args ++
+      ["[ \"$(cat original)\" = original ] && [ -f deleted ] && [ ! -e new ]"]
+
+  it "previews overlays without creating destinations or persistent home" $ \ctx -> do
+    let src = root ctx </> "overlay source"
+        dest = "/tmp/workcell overlay preview"
+        supplied = root ctx </> "new home"
+    createDirectory src
+    out <- success ctx ["--network-host", "--dryrun", "-p", project ctx ++ ":O",
+                        "-v", src ++ ":" ++ dest ++ ":O", "-H", supplied,
+                        "--", "/bin/true"]
+    out `shouldContain` "'--overlay-src'"
+    out `shouldContain` ("'" ++ src ++ "' '--tmp-overlay' '" ++ dest ++ "'")
+    out `shouldContain` ("'" ++ project ctx ++ "' '--tmp-overlay' '" ++ project ctx ++ "'")
+    doesPathExist supplied `shouldReturn` False
+    doesPathExist dest `shouldReturn` False
+
+  it "rejects file overlays and conflicting overlay destinations before creating home" $ \ctx -> do
+    let src = root ctx </> "overlay file"
+        supplied = root ctx </> "new home"
+    writeFile src "original"
+    forM_ [src ++ ":O", src ++ ":/tmp/overlay:O"] $ \volume -> do
+      err <- failure ctx ["-v", volume, "-H", supplied, "--dryrun"]
+      err `shouldContain` "overlay source must be a directory"
+    forM_ [["-p", src ++ ":O"], ["-p", home ctx ++ ":O"],
+           ["-v", project ctx ++ ":O"],
+           ["-v", root ctx ++ ":" ++ home ctx ++ ":O"],
+           ["-v", root ctx ++ ":/tmp/duplicate:O", "-v", root ctx ++ ":/tmp/duplicate:ro"]] $ \args ->
+      void $ failure ctx $ args ++ ["-H", supplied, "--dryrun"]
+    (_, _, err) <- invoke ctx (Just False) Nothing
+      ["-v", root ctx ++ ":/proc:O", "--dryrun"]
+    err `shouldContain` "volume destination must not overlap private /proc"
+    doesPathExist supplied `shouldReturn` False
+
   it "clears other environment variables and applies explicit overrides" $ \ctx -> do
     environment <- getEnvironment
     let supplied = setVariables [("WORKCELL_TEST_SECRET", "hidden"), ("WORKCELL_TEST_PASS", "passed"),
@@ -1060,7 +1132,7 @@ spec = describe "workcell CLI" $ do
   it "rejects invalid options, paths, mounts, and environment names" $ \ctx -> do
     let missing = root ctx </> "missing"
         cases = [["--unknown"], ["-p", "/"], ["-p", missing], ["-v", missing],
-          ["-v", root ctx ++ ":/tmp/extra:O"], ["-v", root ctx ++ ":/"], ["-v", project ctx],
+          ["-v", root ctx ++ ":/tmp/extra:invalid"], ["-v", root ctx ++ ":/"], ["-v", project ctx],
           ["-v", root ctx ++ ":" ++ home ctx], ["-v", root ctx],
           ["-v", root ctx ++ ":/tmp/duplicate", "-v", root ctx ++ ":/tmp/duplicate"],
           ["-v", root ctx ++ ":/usr/workcell-nonexistent-destination"], ["-H", "/"],
@@ -1276,6 +1348,15 @@ shellHome ctx supplied script =
   void $
   success ctx
   ["-H", supplied, "--", "/bin/sh", "-c", "set -eu\n" ++ script]
+
+-- Probe bubblewrap directly so a workcell regression cannot skip overlay tests.
+requireOverlay :: Context -> IO ()
+requireOverlay ctx = do
+  (code, _, err) <- capture $ proc "bwrap"
+    ["--die-with-parent", "--ro-bind", "/", "/",
+     "--overlay-src", project ctx, "--tmp-overlay", project ctx,
+     "--", "/bin/true"]
+  unless (code == ExitSuccess) $ pendingWith $ "bubblewrap overlays unavailable: " ++ err
 
 volumeShell :: Context -> String -> String -> [String] -> IO ()
 volumeShell ctx volume script args =

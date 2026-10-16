@@ -100,6 +100,9 @@ sudo nsenter --target PID --mount --net --pid --root --wd -- /bin/bash
 `-p/--project` defaults to the current directory. The project is mounted writable
 at its original absolute path (resolved through symlinks); commands start there.
 Edits and deletions affect the original project immediately.
+Use `-p DIR:O` for a temporary writable overlay instead: commands start at the
+same canonical project path, but edits, deletions, and new files are discarded
+when the session ends. The source project stays unchanged.
 When the current directory is your home or one of its ancestors, the implicit
 project is omitted and commands start in the isolated home instead. Explicit
 `--project` paths covering your home are rejected, since mounting them would
@@ -110,10 +113,17 @@ symlinks). It is empty and temporary by default. `-H/--home DIR` uses a persiste
 writable directory instead, creating it if missing. The host's original home
 contents are hidden except for the project and explicitly selected volumes.
 
-Repeatable `-v/--volume SOURCE[:DEST][:ro|rw]` mounts an existing file or directory.
+Repeatable `-v/--volume SOURCE[:DEST][:ro|rw|O]` mounts an existing file or directory.
 The destination defaults to the source's absolute path, and access defaults to
 read-only. Relative paths resolve against the invoking directory. Paths containing
-colons and Podman-specific options are unsupported. New destinations and parent
+colons and other Podman-specific options are unsupported. `:O` selects a temporary
+writable directory overlay: `-v /some/path:O` uses the same path, while
+`-v /some/path:/destination:O` selects another destination. Reads come from the
+source; writes and deletions stay in a temporary layer and disappear when the
+session ends. Overlay sources must be directories. This requires bubblewrap
+overlay support and a kernel/filesystem combination permitting overlay mounts;
+there is no automatic fallback to a writable bind mount. Persistent overlay
+storage is not supported. New destinations and parent
 directories are created inside the sandbox, including beneath `/opt`, `/srv`, or
 other unexposed paths. Beneath read-only system mounts such as `/usr` and `/etc`,
 destinations must already exist. Volume destinations

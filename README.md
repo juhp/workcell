@@ -40,8 +40,8 @@ The main way to use workcell is to start a bwrap session.
 `$ workcell run --help`
 
 ```
-Usage: workcell run [-p|--project DIR] [-H|--home DIR]
-                    [-v|--volume SOURCE[:DEST][:ro|rw]] [-e|--env KEY[=VALUE]]
+Usage: workcell run [-p|--project DIR[:O]] [-H|--home DIR]
+                    [-v|--volume SOURCE[:DEST][:ro|rw|O]] [-e|--env KEY[=VALUE]]
                     [--wayland] [--x11] [--dbus] [--dryrun] [--share-processes]
                     [--share-filesystem]
                     [--network-host | --network-none | --network-private]
@@ -50,11 +50,13 @@ Usage: workcell run [-p|--project DIR] [-H|--home DIR]
   Run a workcell bwrap session
 
 Available options:
-  -p,--project DIR         Writable project (default: current directory,
+  -p,--project DIR[:O]     Writable project (:O for temporary overlay;
+                           default: current directory,
                            excluding HOME and ancestors)
   -H,--home DIR            Persistent writable home (created if missing)
-  -v,--volume SOURCE[:DEST][:ro|rw]
-                           Extra mount (default: same path, read-only)
+  -v,--volume SOURCE[:DEST][:ro|rw|O]
+                           Extra mount (:O for temporary directory overlay;
+                           default: same path, read-only)
   -e,--env KEY[=VALUE]     Set or pass through an environment variable
   --wayland                Expose the Wayland display socket for graphical
                            applications
@@ -101,11 +103,13 @@ Available options:
 ```shellsession
 $ workcell run   # open a workcell shell on the cwd
 $ workcell run --project /path/to/project -- git status
+$ workcell run -p /path/to/project:O -- make   # discard project changes on exit
 $ workcell run --home /path/to/sandbox-home   # persistent home, created if missing
 $ workcell run -v ~/.gitconfig -- git status    # mount file ro
 $ workcell run -v ~/.cargo:rw -- cargo build
 $ workcell run -v ~/.config/cabal -v ~/.cache/cabal:rw -v ~/.local/state/cabal:rw -- cabal build --offline
 $ workcell run -v /path/to/data:/tmp/data:ro -- ls /tmp/data
+$ workcell run -v /path/to/data:/tmp/data:O   # temporary writable view of data
 $ workcell run -e LANG -e MY_VAR=hello -- env
 $ workcell run --dryrun -- gcc --version
 $ workcell run --share-processes   # fallback for restricted containers
@@ -115,6 +119,9 @@ $ workcell run --network-host -- curl localhost:8000   # share enclosing network
 $ workcell run --wayland gtk4-demo
 $ workcell run --x11 xterm
 ```
+
+`:O` requires a directory and bubblewrap with overlay support. Changes to that
+mount are discarded when the workcell exits; the source directory stays unchanged.
 
 ### Entering an active workcell
 

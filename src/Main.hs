@@ -44,9 +44,9 @@ withTermination action = do
 
 options :: Parser Options
 options = Options
-  <$> optional (strOptionWith 'p' "project" "DIR" "Writable project (default: current directory, excluding HOME and ancestors)")
+  <$> optional (strOptionWith 'p' "project" "DIR[:O]" "Writable project (:O for temporary overlay; default: current directory, excluding HOME and ancestors)")
   <*> optional (strOptionWith 'H' "home" "DIR" "Persistent writable home (created if missing)")
-  <*> many (strOptionWith 'v' "volume" "SOURCE[:DEST][:ro|rw]" "Extra mount (default: same path, read-only)")
+  <*> many (strOptionWith 'v' "volume" "SOURCE[:DEST][:ro|rw|O]" "Extra mount (:O for temporary directory overlay; default: same path, read-only)")
   <*> many (strOptionWith 'e' "env" "KEY[=VALUE]" "Set or pass through an environment variable")
   <*> switchLongWith "wayland" "Expose the Wayland display socket for graphical applications"
   <*> switchLongWith "x11" "Expose the local X11 display socket and authentication file"

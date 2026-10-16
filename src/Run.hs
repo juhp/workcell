@@ -10,6 +10,7 @@ import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
+import Data.List.Extra (stripSuffix)
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
@@ -42,10 +43,13 @@ data Options = Options
   , command :: [String]
   }
 
+data MountMode = ReadOnlyMount | ReadWriteMount | OverlayMount
+  deriving Eq
+
 data Mount = Mount
   { source :: FilePath
   , destination :: FilePath
-  , writable :: Bool
+  , mountMode :: MountMode
   }
 
 data Launch = Launch
@@ -123,7 +127,10 @@ withSystemFiles ((index, path):rest) action =
 prepare :: Options -> IO Launch
 prepare opts = do
   let mode = fromMaybe PrivateNetwork $ networkOption opts
-  candidate <- existingDirectory "project" (fromMaybe "." $ projectOption opts)
+  let (projectPath, projectMode) = case projectOption opts of
+        Just path | Just directory <- stripSuffix ":O" path -> (directory, OverlayMount)
+        path -> (fromMaybe "." path, ReadWriteMount)
+  candidate <- existingDirectory "project" projectPath
   originalHome <- getHomeDirectory
   unless (isAbsolute originalHome) $ invalid "HOME must be an absolute path"
   home <- existingDirectory "HOME" originalHome
@@ -195,7 +202,7 @@ prepare opts = do
       args = beforeSystemFiles ++ concatMap fst systemMounts
         ++ ["--unshare-net" | mode /= HostNetwork]
         ++ concatMap mountArgs mounts
-        ++ maybe [] (\path -> ["--bind", path, path]) project
+        ++ maybe [] (\path -> mountArgs $ Mount path path projectMode) project
         ++ ["--chdir", fromMaybe home project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ desktopEnv ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
@@ -215,7 +222,7 @@ waylandSetup = do
   status <- getFileStatus socket
   unless (isSocket status) $ invalid $ "Wayland display is not a socket: " ++ socket
   src <- canonicalizePath socket
-  pure ([Mount src socket False],
+  pure ([Mount src socket ReadOnlyMount],
         [("XDG_RUNTIME_DIR", runtime), ("WAYLAND_DISPLAY", display)])
 
 x11Setup :: FilePath -> IO ([Mount], [(String, String)])
@@ -237,7 +244,7 @@ x11Setup home = do
   authority <- lookupEnv "XAUTHORITY" >>= canonicalizePath . fromMaybe (home </> ".Xauthority")
   authStatus <- getFileStatus authority
   unless (isRegularFile authStatus) $ invalid $ "X11 authority is not a regular file: " ++ authority
-  pure ([Mount socket socket False, Mount authority authTarget False],
+  pure ([Mount socket socket ReadOnlyMount, Mount authority authTarget ReadOnlyMount],
         [("DISPLAY", display), ("XAUTHORITY", authTarget)])
   where
     badDisplay = invalid "--x11 requires a local DISPLAY such as :0 or :0.0 (TCP displays are unsupported)"
@@ -262,7 +269,7 @@ dbusSetup = do
   unless (isSocket status) $ invalid $ "D-Bus session address is not a socket: " ++ socket
   src <- canonicalizePath socket
   let target = "/run/workcell-session-bus"
-  pure ([Mount src target False], [("DBUS_SESSION_BUS_ADDRESS", "unix:path=" ++ target)])
+  pure ([Mount src target ReadOnlyMount], [("DBUS_SESSION_BUS_ADDRESS", "unix:path=" ++ target)])
   where
     badAddress = invalid "--dbus requires a single unix:path= session address (abstract and TCP sockets are unsupported)"
     splitComma input = case break (== ',') input of
@@ -361,7 +368,7 @@ preservedSystemFiles shared preserveResolver = fmap concat $ forM
     let hidden target = if shared then any (`within` target) temporaryRoots
                         else not $ any (`within` target) systemDirectories
     target <- hiddenSystemTarget hidden path
-    pure $ maybe [] (\dest -> [Mount resolved dest False]) target
+    pure $ maybe [] (\dest -> [Mount resolved dest ReadOnlyMount]) target
 
 -- Stop at the first hidden part of a symlink chain. Its final target may be
 -- exposed under /usr, while an intermediate link under /run is still hidden.
@@ -403,26 +410,30 @@ resolveHome path = do
 
 resolveMount :: String -> IO Mount
 resolveMount spec = do
-  (src, dst, rw) <- either invalid pure (parseMount spec)
+  (src, dst, mode) <- either invalid pure (parseMount spec)
   exists <- doesPathExist src
   unless exists $ invalid $ "volume source does not exist: " ++ src
   srcPath <- canonicalizePath src
+  when (mode == OverlayMount) $
+    unlessM (doesDirectoryExist srcPath) $
+      invalid $ "overlay source must be a directory: " ++ src
   dstPath <- canonicalizePath (fromMaybe src dst)
   rejectRoot "volume destination" dstPath
-  pure $ Mount srcPath dstPath rw
+  pure $ Mount srcPath dstPath mode
 
-parseMount :: String -> Either String (FilePath, Maybe FilePath, Bool)
+parseMount :: String -> Either String (FilePath, Maybe FilePath, MountMode)
 parseMount spec = case splitColon spec of
-  [src] | valid src -> Right (src, Nothing, False)
+  [src] | valid src -> Right (src, Nothing, ReadOnlyMount)
   [src, mode] | valid src, Just rw <- access mode -> Right (src, Nothing, rw)
-  [src, dst] | valid src && valid dst -> Right (src, Just dst, False)
+  [src, dst] | valid src && valid dst -> Right (src, Just dst, ReadOnlyMount)
   [src, dst, mode] | valid src && valid dst, Just rw <- access mode ->
     Right (src, Just dst, rw)
-  _ -> Left $ "invalid volume (expected SOURCE[:DEST][:ro|rw]): " ++ spec
+  _ -> Left $ "invalid volume (expected SOURCE[:DEST][:ro|rw|O]): " ++ spec
   where
     valid = not . null
-    access "ro" = Just False
-    access "rw" = Just True
+    access "ro" = Just ReadOnlyMount
+    access "rw" = Just ReadWriteMount
+    access "O" = Just OverlayMount
     access _ = Nothing
 
 splitColon :: String -> [String]
@@ -451,8 +462,10 @@ validateMount shared project home mount = do
     invalid $ "volume source and destination must both be files or both directories: " ++ dest
 
 mountArgs :: Mount -> [String]
-mountArgs mount = [if writable mount then "--bind" else "--ro-bind",
-                  source mount, destination mount]
+mountArgs mount = case mountMode mount of
+  ReadOnlyMount -> ["--ro-bind", source mount, destination mount]
+  ReadWriteMount -> ["--bind", source mount, destination mount]
+  OverlayMount -> ["--overlay-src", source mount, "--tmp-overlay", destination mount]
 
 resolveEnvironment :: String -> IO (String, String)
 resolveEnvironment spec = do
