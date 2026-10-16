@@ -1,0 +1,3 @@
+snapshot: lts-18.28
+extra-deps:
+- simple-cmd-args-0.1.8
