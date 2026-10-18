@@ -31,10 +31,12 @@ source-repository head
 
 executable workcell
   main-is:             Main.hs
-  other-modules:       Enter
+  other-modules:       Child
+                       Enter
                        Run
-                       Network
+                       Sandbox
                        Session
+                       Util
                        Paths_workcell
   autogen-modules:     Paths_workcell
   hs-source-dirs:      src
@@ -68,8 +70,10 @@ test-suite integration
   type:                exitcode-stdio-1.0
   main-is:             Spec.hs
   hs-source-dirs:      test src
-  other-modules:       Network
+  other-modules:       Child
+                       Sandbox
                        Session
+                       Util
   build-depends:       base < 5,
                        aeson,
                        bytestring,

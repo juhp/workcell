@@ -1,17 +1,18 @@
--- SPDX-License-Identifier: BSD-3-Clause
+-- SPDX-License-Identifier: LGPL-2.1-or-later
 
 module Main (main) where
 
 import Control.Concurrent (myThreadId)
-import Control.Exception (IOException, bracket, catch, throwTo)
+import Control.Exception (Handler(..), IOException, bracket, catches, throwTo)
 import Control.Monad (void)
 import SimpleCmdArgs
 import System.Exit (ExitCode(..), die)
-import System.Posix.Signals (Handler(CatchOnce), installHandler, sigTERM)
+import System.Posix.Signals (Handler(CatchOnce), Signal, installHandler, sigHUP, sigTERM)
 
 import Enter (enterSession)
 import Paths_workcell (version)
 import Run (Options(..), runWorkcell, NetworkMode(..))
+import Sandbox (NetworkSetupFailure)
 import Session (listSessions)
 
 main :: IO ()
@@ -31,16 +32,21 @@ main =
       runWorkcell <$> options
     ]
   where
-    execute action = withTermination action `catch` report
-    report :: IOException -> IO ()
-    report err = die $ "workcell: " ++ show err
+    execute action = withTermination action `catches`
+      [Handler $ \err -> die $ "workcell: " ++ show (err :: IOException),
+       Handler $ \err -> die $ "workcell: " ++ show (err :: NetworkSetupFailure)]
 
--- Turn termination into an exception so session/helper brackets can clean up.
+-- Turn termination and hangup into exceptions so session/helper brackets
+-- can clean up.
 withTermination :: IO a -> IO a
-withTermination action = do
-  thread <- myThreadId
-  bracket (installHandler sigTERM (CatchOnce $ throwTo thread $ ExitFailure 143) Nothing)
-    (\previous -> void (installHandler sigTERM previous Nothing)) $ const action
+withTermination action =
+  withSignal sigTERM 143 $ withSignal sigHUP 129 action
+  where
+    withSignal :: Signal -> Int -> IO a -> IO a
+    withSignal signal code inner = do
+      thread <- myThreadId
+      bracket (installHandler signal (CatchOnce $ throwTo thread $ ExitFailure code) Nothing)
+        (\previous -> void (installHandler signal previous Nothing)) $ const inner
 
 options :: Parser Options
 options = Options

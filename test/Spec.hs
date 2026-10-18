@@ -29,8 +29,9 @@ import System.Process hiding (shell)
 import System.Timeout (timeout)
 import Test.Hspec
 
-import qualified Network as WorkcellNetwork
+import qualified Sandbox as WorkcellSandbox
 import qualified Session as WorkcellSession
+import qualified Util as WorkcellUtil
 
 data Context = Context
   { binary :: FilePath
@@ -46,13 +47,21 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-    "--test-tracked-loopback-network":bwrapArgs ->
-      WorkcellNetwork.runTrackedPrivateNetwork
-        (WorkcellSession.withSession $ WorkcellSession.SessionDetails Nothing ["sleep", "30"] "private" False)
-        ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
+    "--test-tracked-loopback-network":bwrapArgs -> withTestTermination $
+      WorkcellSandbox.runSandbox loopbackNetwork
+        (WorkcellSession.withSession $ WorkcellSession.SessionDetails Nothing ["sleep", "30"]
+           WorkcellSandbox.PrivateNetwork False)
+        (testSandbox bwrapArgs) >>= exitWith
     "--test-loopback-network":bwrapArgs -> withTestTermination $
-      WorkcellNetwork.runPrivateNetwork ["--splice-only"] bwrapArgs "/tmp/workcell-test-resolv" >>= exitWith
+      WorkcellSandbox.runSandbox loopbackNetwork WorkcellSandbox.untracked
+        (testSandbox bwrapArgs) >>= exitWith
     _ -> testMain
+  where
+    loopbackNetwork = Just $
+      WorkcellSandbox.PrivateNetworkConfig ["--splice-only"] "/tmp/workcell-test-resolv"
+    testSandbox args =
+      let (options, cmd) = break (== "--") args
+      in WorkcellSandbox.Sandbox (map WorkcellSandbox.Arg options) (drop 1 cmd)
 
 -- Match the CLI's SIGTERM handling so the helper exercises bracket cleanup.
 withTestTermination :: IO a -> IO a
@@ -315,14 +324,13 @@ spec = describe "workcell CLI" $ do
       length (lines output) `shouldBe` 2
       output `shouldNotContain` "s999"
 
-  it "ignores records left by an uncatchable supervisor stop" $ \ctx -> do
+  it "ignores and removes records left by an uncatchable supervisor stop" $ \ctx -> do
     withRunningSessionHandle ctx [] $ \ident handle -> do
       pid <- getPid handle >>= maybe (fail "supervisor exited unexpectedly") pure
       signalProcess sigKILL pid
       _ <- waitForProcess handle
       sessionInvoke ctx ["list"] >>= successful >>= (`shouldBe` "")
-      paths <- sessionRecordPaths ctx
-      length paths `shouldBe` 1
+      sessionRecordPaths ctx >>= (`shouldBe` [])
       (code, _, _) <- sessionInvoke ctx ["enter", ident]
       code `shouldNotBe` ExitSuccess
 
@@ -526,7 +534,7 @@ spec = describe "workcell CLI" $ do
     readFile (project ctx </> "command-count") `shouldReturn` "run\n"
     dry <- successful =<< invokeDefault ctx Nothing (Just envs)
       ["--dryrun", "-H", root ctx </> "dry home"]
-    dry `shouldContain` "fall back to host if preflight fails"
+    dry `shouldContain` "fall back to host if network setup fails"
     dry `shouldContain` "'pasta'"
     dry `shouldNotContain` "'--network-host'"
     doesPathExist (root ctx </> "dry home") `shouldReturn` False
@@ -585,6 +593,7 @@ spec = describe "workcell CLI" $ do
       unlines ["[ \"$(id -u)\" = \"$2\" ]", "[ \"$(id -g)\" = \"$3\" ]",
                "[ \"$(readlink /proc/self/ns/net)\" != \"$4\" ]", "[ \"$(hostname)\" = \"$5\" ]",
                "grep -qx 'nameserver 169.254.1.1' /tmp/workcell-test-resolv",
+               "[ \"$(ls /proc/self/fd | wc -l)\" = 4 ]",
                "printf '%s' \"$1\"", "exit 23"],
       "check", value, show uid, show gid, namespace, hostname]
     (code, out, err) <- capture invocation
@@ -650,7 +659,7 @@ spec = describe "workcell CLI" $ do
                  filter ((/= "XDG_RUNTIME_DIR") . fst) (fromMaybe environment $ env invocation)
       _ <- successful =<< capture (invocation {env = Just envs})
       pidPath <- readFile (project ctx </> "helper-pid-path")
-      pidPath `shouldSatisfy` ((fromMaybe "/tmp" selectedRuntime ++ "/workcell-network-") `isPrefixOf`)
+      pidPath `shouldSatisfy` ((fromMaybe "/tmp" selectedRuntime ++ "/workcell-session-") `isPrefixOf`)
       doesPathExist (takeDirectory pidPath) `shouldReturn` False
 
   it "drains large pasta diagnostics into the retained log before reporting failure" $ \ctx -> do
@@ -775,21 +784,46 @@ spec = describe "workcell CLI" $ do
       pure ()
     doesPathExist (root ctx </> "state/workcell/logs") `shouldReturn` False
 
-  it "discards successful preflight logs but retains failed preflight diagnostics" $ \ctx -> do
+  it "keeps only nonempty logs and reports failed private setup diagnostics" $ \ctx -> do
     unless (pastaNet ctx) $ pendingWith "private pasta networking is unavailable here"
     environment <- getEnvironment
     let stateEnv = setVariables [("XDG_STATE_HOME", root ctx </> "state")] environment
     _ <- successful =<< invoke ctx Nothing (Just stateEnv) ["--network-private", "--", "/bin/true"]
     retained <- pastaLogs ctx
     forM_ retained $ getFileSize >=> (`shouldSatisfy` (> 0))
-    invocation <- fakeHelperCommand ctx "echo preflight-failure >&2\nexit 42" ["/bin/true"]
+    invocation <- fakeHelperCommand ctx "echo setup-failure >&2\nexit 42" ["/bin/true"]
     (code, _, err) <- invoke ctx Nothing (env invocation)
       ["--network-private", "-H", root ctx </> "uncreated home", "--", "/bin/true"]
     code `shouldNotBe` ExitSuccess
-    err `shouldContain` "preflight-failure"
+    err `shouldContain` "setup-failure"
     err `shouldContain` "Pasta log:"
     pastaLogs ctx >>= (\logs -> length logs `shouldBe` length retained + 1)
-    doesPathExist (root ctx </> "uncreated home") `shouldReturn` False
+    created <- doesPathExist (root ctx </> "uncreated home")
+    when created $ expectationFailure $ "persistent home was not removed after: " ++ err
+
+  it "removes a newly created persistent home when private setup fails" $ \ctx -> do
+    unless (privateNet ctx) $ pendingWith "container blocks network namespaces"
+    let tools = root ctx </> "failing tools"
+        supplied = root ctx </> "new home"
+        keptHome = root ctx </> "existing home"
+    createDirectory tools
+    createDirectory keptHome
+    writeFile (tools </> "pasta") "#!/bin/sh\necho setup-failure >&2\nexit 42\n"
+    setFileMode (tools </> "pasta") 0o700
+    -- A placeholder TUN device lets the failing helper be reached without one.
+    -- The project lies beneath HOME, so bubblewrap creates its mountpoint
+    -- inside the new home before network setup fails.
+    forM_ [(supplied, False), (keptHome, True)] $ \(path, kept) -> do
+      let args = ["--ro-bind", "/", "/", "--dev", "/dev", "--dev-bind", "/dev/null", "/dev/net/tun",
+                  "--proc", "/proc", "--bind", root ctx, root ctx,
+                  "--setenv", "PATH", tools ++ ":/usr/bin:/bin",
+                  "--setenv", "XDG_STATE_HOME", root ctx </> "state", "--", binary ctx, "run"] ++
+                 ["--share-processes" | not (privateProc ctx)] ++
+                 ["--network-private", "-H", path, "--", "/bin/true"]
+      (code, _, err) <- capture ((fixtureProcess args) {cwd = Just (project ctx)})
+      code `shouldNotBe` ExitSuccess
+      err `shouldContain` "pasta exited during network setup"
+      doesPathExist path `shouldReturn` kept
 
   it "can explicitly share the enclosing PID namespace" $ \ctx -> do
     expected <- readSymbolicLink "/proc/self/ns/pid"
@@ -1138,6 +1172,16 @@ spec = describe "workcell CLI" $ do
     check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/unescaped space")] "unescaped character"
     check [("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp")] "not a socket"
 
+  it "passes environment values and arguments that look like separators" $ \ctx -> do
+    out <- success ctx ["-e", "SEPARATOR=--", "--", "/bin/sh", "-c",
+                        "printf '%s %s' \"$SEPARATOR\" \"$1\"", "check", "--"]
+    out `shouldBe` "-- --"
+
+  it "passes no supervisor descriptors to the command" $ \ctx -> do
+    forM_ ("host" : ["none" | privateNet ctx]) $ \mode -> do
+      out <- success ctx ["--network-" ++ mode, "--", "/bin/ls", "/proc/self/fd"]
+      lines out `shouldBe` ["0", "1", "2", "3"]
+
   it "forwards arguments without interpreting options or shell syntax" $ \ctx -> do
     let args = ["run", "enter", "list", "--root", "--home", "-p", "", "a b", "'", "$HOME", "`uname`", "line\nbreak"]
     success ctx (["--", "/usr/bin/printf", "%s\\0"] ++ args)
@@ -1232,7 +1276,7 @@ spec = describe "workcell CLI" $ do
     BS.writeFile replacement replaced
     forM_ ("host" : ["none" | privateNet ctx]) $ \mode ->
       forM_ [False, True] $ \override ->
-      bracket (WorkcellNetwork.openSimpleFd fixture Posix.ReadOnly) Posix.closeFd $ \fd -> do
+      bracket (WorkcellUtil.openSimpleFd fixture Posix.ReadOnly) Posix.closeFd $ \fd -> do
         let outer = ["--ro-bind", "/", "/", "--proc", "/proc",
                      "--bind", project ctx, project ctx, "--ro-bind", sparseEtc, "/etc",
                      "--tmpfs", "/run", "--ro-bind-data", show fd, "/run/host/etc/localtime",

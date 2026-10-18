@@ -2,3 +2,6 @@
 .stack-work/
 dist-newstyle/
 stack.yaml.lock
+codex-session-*.md
+.old/
+TAGS

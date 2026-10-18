@@ -76,7 +76,7 @@ Available options:
 ```
 
 Default networking tries to set up private networking but
-falls back to host networking if preflight fails.
+falls back to host networking if its setup fails.
 Workcell will print a warning before launching the command.
 `--network-private` requires successful private setup.
 
@@ -98,6 +98,8 @@ Available options:
   --root                   Enter as root inside the workcell
   -h,--help                Show this help text
 ```
+NB Ending the `run` session first currently kills any `enter` one running.
+This should be improved later. Recommend running tmux inside workcell.
 
 ## Examples
 
@@ -142,7 +144,8 @@ The session ID is optional. With one active session, `enter` uses it automatical
 With multiple sessions and terminal input, it shows a numbered menu and prompts
 for a choice; press Enter to cancel. Without terminal input, it lists the sessions
 and returns an error asking for an ID. With no active sessions, it reports an error.
-`--root` and `--dryrun` also work without an ID. Supply an explicit ID when pass
+`--root` and `--dryrun` also work without an ID. Supply an explicit ID when passing
+a command.
 
 ## Requirements
 Linux
@@ -171,4 +174,4 @@ Workcell is distributed under LGPLv2.1+
 
 <https://github.com/juhp/workcell>
 
-See also the generated [Notes](Notes.md) for various more details.
+See also the generated [Notes](NOTES.md) for various more details.

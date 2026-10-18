@@ -1,5 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
--- SPDX-License-Identifier: BSD-3-Clause
+-- SPDX-License-Identifier: LGPL-2.1-or-later
 
 module Session (
   SessionDetails(..),
@@ -21,7 +21,7 @@ import qualified Data.ByteString.Char8 as BSC
 import Data.Bits ((.&.))
 import Data.Char (isDigit, isAsciiLower, isAsciiUpper)
 import Data.List (intercalate, sort, transpose)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import GHC.Generics (Generic)
 import SimpleCmd (warning)
 import System.Directory
@@ -30,16 +30,19 @@ import System.FilePath ((</>), isAbsolute, takeFileName)
 import System.IO
   (Handle, hClose, hFlush, hIsTerminalDevice, isEOF, hPutStr, hPutStrLn,
    openBinaryTempFile, stderr, stdin, stdout)
-import System.IO.Error (catchIOError, isDoesNotExistError)
+import System.IO.Error (catchIOError)
 import System.Posix.Files
 import System.Posix.User (getEffectiveUserID)
 import System.Timeout (timeout)
 import Text.Read (readMaybe)
 
+import Sandbox (NetworkMode, networkName)
+import Util (ignoreMissing, invalid, procPath, shellQuote)
+
 data SessionDetails = SessionDetails
   { sessionProject :: Maybe FilePath
   , sessionCommand :: [String]
-  , sessionNetwork :: String
+  , sessionNetwork :: NetworkMode
   , sessionSharedProcesses :: Bool
   } deriving (Show, Generic)
 
@@ -58,9 +61,6 @@ data Session = Session
 instance FromJSON Session
 instance ToJSON Session
 
-invalid :: String -> IO a
-invalid = ioError . userError
-
 strictRead :: FilePath -> IO String
 strictRead path = map (toEnum . fromEnum) . BS.unpack <$> BS.readFile path
 
@@ -69,9 +69,6 @@ bootID = unwords . words <$> strictRead "/proc/sys/kernel/random/boot_id"
 
 pidNamespace :: IO String
 pidNamespace = readSymbolicLink "/proc/self/ns/pid"
-
-procPath :: Int -> FilePath -> FilePath
-procPath pid suffix = "/proc" </> show pid </> suffix
 
 -- comm may contain spaces and closing parentheses; fields after its LAST ')'
 -- start with state (field 3), making starttime (field 22) index 19.
@@ -152,25 +149,22 @@ findCommandPID pid = do
   case result of
     Just found -> pure found
     Nothing -> do
-      _ <- processStart pid
+      _ <- catchIOError (processStart pid) $ const $
+        invalid "the sandbox exited during setup"
       threadDelay 10000
       findCommandPID pid
   where
-    search candidate = do
+    -- Processes may exit while being inspected; retry from the top.
+    search candidate = flip catchIOError (const $ pure Nothing) $ do
       argv <- BS.split 0 <$> BS.readFile (procPath candidate "cmdline")
-      if any (`elem` argv) [BSC.pack "workcell-session", BSC.pack "workcell-network"] &&
-         take 1 argv == [BSC.pack "/bin/sh"]
+      if take 2 argv == map BSC.pack ["/bin/sh", "-c"] && BSC.pack "workcell-session" `elem` argv
         then pure $ Just candidate
         else do
           children <- words <$> strictRead (procPath candidate $ "task" </> show candidate </> "children")
-          results <- mapM (search . read) children
+          results <- mapM search $ mapMaybe readMaybe children
           pure $ case catMaybes results of
             found:_ -> Just found
             [] -> Nothing
-
-ignoreMissing :: IO () -> IO ()
-ignoreMissing action = catchIOError action $ \err ->
-  unless (isDoesNotExistError err) $ ioError err
 
 validSession :: Session -> IO Bool
 validSession record = catchIOError check $ const $ pure False
@@ -190,8 +184,14 @@ sessions = do
   if not exists then pure [] else do
     paths <- sort <$> listDirectory directory
     records <- mapM (readRecord directory) $ filter validID paths
-    filterM validSession $ catMaybes records
+    filterM (removeStale directory) $ catMaybes records
   where
+    -- Records left behind by an uncatchable stop (or SIGKILL) are removed
+    -- once their process is gone.
+    removeStale directory record = do
+      valid <- validSession record
+      unless valid $ ignoreMissing $ removeFile $ directory </> sessionID record
+      pure valid
     readRecord directory ident = catchIOError (do
       let path = directory </> ident
       status <- getSymbolicLinkStatus path
@@ -207,9 +207,6 @@ sessions = do
 validID :: String -> Bool
 validID ('s':suffix) = not (null suffix) && all (\c -> isDigit c || isAsciiLower c || isAsciiUpper c || c == '-') suffix
 validID _ = False
-
-quote :: String -> String
-quote value = "'" ++ concatMap (\c -> if c == '\'' then "'\\''" else [c]) value ++ "'"
 
 listSessions :: IO ()
 listSessions = sessions >>= printSessions
@@ -230,7 +227,7 @@ printSessionRows output numbered records =
     row record =
       let details = sessionDetails record
       in [sessionID record, fromMaybe "-" $ sessionProject details,
-         sessionNetwork details, unwords $ map quote $ sessionCommand details]
+         networkName (sessionNetwork details), unwords $ map shellQuote $ sessionCommand details]
 
 findSession :: Maybe String -> IO Session
 findSession Nothing = do

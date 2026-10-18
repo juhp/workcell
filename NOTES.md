@@ -82,8 +82,9 @@ existing absolute `$XDG_RUNTIME_DIR`, or `/tmp` as a fallback, so pasta does not
 need to write under a home-based `TMPDIR`.
 
 Listing and entry validate the PID, process start time, boot ID, and namespace
-identity. Normal exit and termination remove the record; an uncatchable stop
-may leave a stale record, which is ignored. Only sessions started by this
+identity. Normal exit, termination, and hangup remove the record; a record
+left by an uncatchable stop is ignored and removed by the next listing or
+entry. Only sessions started by this
 version are registered. Discovery is scoped to the caller's PID namespace:
 sharing a runtime directory between toolboxes does not by itself allow entry
 from another PID or user namespace. Namespace permissions still apply.
@@ -258,8 +259,9 @@ are snapshots. Private networking's generated resolver remains a launch-time
 snapshot of search/domain and options settings.
 
 By default, networking tries a private network through pasta, with a separate
-network namespace and outbound connectivity. If preflight fails, workcell warns
-and uses the enclosing host network instead. Explicit `--network-private`
+network namespace and outbound connectivity. If private network setup fails
+before the command is released, workcell warns and uses the enclosing host
+network instead. Explicit `--network-private`
 requires private setup to succeed.
 Automatic TCP and UDP forwarding is disabled in both directions in private mode,
 and the special host loopback/gateway mappings are disabled. Workcell does not
@@ -269,13 +271,14 @@ Choose a mode with one of these mutually exclusive flags:
 
 | Flag | Connectivity |
 | --- | --- |
-| (none) | Try private networking; warn and use host networking if preflight fails. |
+| (none) | Try private networking; warn and use host networking if setup fails. |
 | `--network-private` | Outbound networking through pasta; separate localhost. |
 | `--network-host` | Share the enclosing network, including its localhost services. |
 | `--network-none` | Private loopback only; no external connectivity; pasta not required. |
 
 Network mode is independent of `--share-processes` and `--share-filesystem`.
-Fallback happens only during preflight, before the requested command starts.
+Fallback happens only during network setup, while the requested command is
+still paused, so the command never runs twice.
 The session list records the selected mode (`private` or `host`). Once the
 command starts, failures are returned without retrying it. Default dry runs show
 the private-network plan and note possible host fallback without probing networking.
@@ -298,14 +301,16 @@ variable is unset or not absolute. This location uses the enclosing environment,
 before workcell isolates the home directory. When diagnostics are present, startup
 failures and unexpected helper exits report the log path and up to 20 recent
 lines (at most 8 KiB) in the terminal. Command output and bubblewrap errors still go to the terminal.
-Successful network-preflight logs and empty logs are removed on shutdown.
-Nonempty failed-preflight and actual-run logs are retained, with no automatic pruning. Logging does not fix network
+Empty logs are removed on shutdown. Nonempty logs are retained, with no
+automatic pruning. Logging does not fix network
 errors; it keeps helper diagnostics from interrupting interactive programs.
 
 Private mode needs pasta on `PATH`, an accessible `/dev/net/tun`, a configured
 nameserver in `/etc/resolv.conf`, and permission to create the required
-namespaces. Workcell checks network setup before creating a persistent home or
-running your command. Explicit `--network-private` fails if setup is unavailable;
+namespaces. Workcell checks these requirements before creating a persistent home,
+and never runs your command before pasta is ready. If setup fails with explicit
+`--network-private`, a persistent home created for the run is removed again.
+Explicit `--network-private` fails if setup is unavailable;
 the default behavior falls back to host networking.
 An enclosing workcell's minimal `/dev` hides `/dev/net/tun`, so nested private
 networking needs that device exposed by the enclosing sandbox; alternatively,

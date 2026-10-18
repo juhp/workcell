@@ -1,44 +1,23 @@
-{-# LANGUAGE CApiFFI #-}
-{-# LANGUAGE ForeignFunctionInterface #-}
--- SPDX-License-Identifier: BSD-3-Clause
+-- SPDX-License-Identifier: LGPL-2.1-or-later
 module Enter (enterSession) where
 
 import Control.Exception (bracket)
 import Control.Monad (unless)
 import qualified Data.ByteString.Char8 as BS
-import Foreign.C.Error (throwErrnoIfMinus1)
-import Foreign.C.Types (CInt(..), CULong(..))
 import SimpleCmd (needProgram)
 import System.Directory (findExecutable)
 import System.Exit (exitWith)
 import System.FilePath ((</>))
 import System.IO (hIsTerminalDevice, stdin, stdout)
 import System.Posix.Files (readSymbolicLink)
-import System.Posix.IO (OpenMode(..), closeFd)
+import System.Posix.IO (closeFd)
 import System.Posix.Process (getProcessID)
-import System.Posix.Types (Fd(..))
-import System.Process (CreateProcess(..), proc, waitForProcess)
+import System.Process (CreateProcess(..), proc)
 
-import Network (withChild, openSimpleFd)
+import Child (waitChild, withChild)
+import Sandbox (NetworkMode(..))
 import Session (Session(..), SessionDetails(..), findSession, validSession)
-
-invalid :: String -> IO a
-invalid = ioError . userError
-
-procPath :: Int -> FilePath -> FilePath
-procPath pid suffix = "/proc" </> show pid </> suffix
-
-quote :: String -> String
-quote value = "'" ++ concatMap (\c -> if c == '\'' then "'\\''" else [c]) value ++ "'"
-
-foreign import ccall unsafe "ioctl"
-  namespaceIoctl :: CInt -> CULong -> CULong -> IO CInt
-foreign import capi unsafe "linux/nsfs.h value NS_GET_USERNS"
-  getOwnerNamespace :: CULong
-
-ownerNamespace :: Fd -> IO Fd
-ownerNamespace (Fd fd) = Fd <$> throwErrnoIfMinus1 "mount namespace owner"
-  (namespaceIoctl fd getOwnerNamespace 0)
+import Util (invalid, ownerNamespace, procPath, shellQuote, withDescriptors)
 
 enterSession :: Bool -> Maybe String -> Bool -> [String] -> IO ()
 enterSession dry ident root command = do
@@ -50,7 +29,7 @@ enterSession dry ident root command = do
   let pid = sessionPID record
       details = sessionDetails record
       namespaces = ["mnt"] ++ ["pid" | not $ sessionSharedProcesses details] ++
-        ["net" | sessionNetwork details /= "host"]
+        ["net" | sessionNetwork details /= HostNetwork]
       flag "mnt" = "--mount"
       flag name = "--" ++ name
       -- Preserve the mapped host credentials in either mode: setup-namespace
@@ -82,7 +61,7 @@ enterSession dry ident root command = do
             nsenter <- findExecutable "nsenter" >>= maybe (invalid "nsenter is required for entry") pure
             pure $ [nsenter, "--user=/proc/" ++ insidePID ++ "/ns/user", "--preserve-credentials", "--"] ++ entryCommand
         if dry
-          then putStrLn $ unwords $ map quote $
+          then putStrLn $ unwords $ map shellQuote $
                ["nsenter", "--user=" ++ procPath pid "ns/user"] ++
                ["--user-parent" | ownerUser /= targetUser] ++
                [flag name ++ "=" ++ procPath pid ("ns" </> name) | name <- namespaces] ++
@@ -100,7 +79,7 @@ enterSession dry ident root command = do
             -- nsenter opens the supervisor's descriptors before joining. Its
             -- command inherits none of our namespace/root directory handles.
             result <- withChild ((proc "nsenter" args)
-              {delegate_ctlc = True, close_fds = True}) waitForProcess
+              {delegate_ctlc = True, close_fds = True}) waitChild
             exitWith result
       _ -> invalid "missing mount namespace descriptor"
 
@@ -115,11 +94,5 @@ terminalCommand command = do
       script <- findExecutable "script"
       case script of
         Just path -> pure [path, "--quiet", "--return", "--command",
-                           "exec " ++ unwords (map quote command), "/dev/null"]
+                           "exec " ++ unwords (map shellQuote command), "/dev/null"]
         Nothing -> invalid "interactive entry requires systemd-pty-forward or script (from util-linux)"
-
-withDescriptors :: [FilePath] -> ([Fd] -> IO a) -> IO a
-withDescriptors [] action = action []
-withDescriptors (path:rest) action = bracket
-  (openSimpleFd path ReadOnly) closeFd $ \fd ->
-  withDescriptors rest $ \fds -> action (fd:fds)

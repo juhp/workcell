@@ -1,31 +1,32 @@
--- SPDX-License-Identifier: BSD-3-Clause
+-- SPDX-License-Identifier: LGPL-2.1-or-later
 module Run (
   Options(..),
   NetworkMode(..),
   runWorkcell)
 where
 
-import Control.Exception (bracket)
-import Control.Monad.Extra (forM, unless, unlessM, when, whenJust)
+import Control.Exception (catch, onException)
+import Control.Monad.Extra (allM, forM, unless, unlessM, when)
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.ByteString as BS
 import Data.List (intercalate, isPrefixOf, nub)
-import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import GHC.Foreign (peekCString)
 import GHC.IO.Encoding (getFileSystemEncoding)
-import SimpleCmd (cmdFull, needProgram, warning, (+-+))
+import SimpleCmd (needProgram, warning, (+-+))
 import System.Directory
   (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist,
-   doesPathExist, getHomeDirectory, getSymbolicLinkTarget, pathIsSymbolicLink)
+   doesPathExist, getHomeDirectory, getSymbolicLinkTarget, listDirectory, pathIsSymbolicLink,
+   removeDirectory)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (exitWith)
 import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
-import System.Posix.IO (OpenMode(..), closeFd)
 
-import Network (NetworkMode(..), pastaArguments, runTrackedPrivateNetwork, runTrackedSandbox, verifyNetwork, openSimpleFd)
+import Sandbox
 import Session (SessionDetails(..), withSession)
+import Util (invalid, shellQuote)
 
 data Options = Options
   { projectOption :: Maybe FilePath
@@ -52,75 +53,102 @@ data Mount = Mount
   }
 
 data Launch = Launch
-  { arguments :: [String]
+  { launchSandbox :: Sandbox
   , persistentHome :: Maybe FilePath
   , selectedNetwork :: NetworkMode
-  , resolverDestination :: FilePath
-  , copiedSystemFiles :: [(Int, FilePath)]
+  , resolverTarget :: FilePath
   , launchProject :: Maybe FilePath
   }
+
+privateNetwork :: Launch -> Maybe PrivateNetwork
+privateNetwork launch
+  | selectedNetwork launch == PrivateNetwork =
+      Just $ PrivateNetworkConfig [] (resolverTarget launch)
+  | otherwise = Nothing
 
 runWorkcell :: Options -> IO ()
 runWorkcell opts = do
   planned <- prepare opts
-  when (dryRun opts && isNothing (networkOption opts)) $
-    putStrLn "# trying private networking; fall back to host if preflight fails"
-  if dryRun opts
-    then if selectedNetwork planned == PrivateNetwork || not (null $ copiedSystemFiles planned)
-      then do
-        let networkPlan =
-              if selectedNetwork planned == PrivateNetwork
-              then ["--info-fd", "<info-fd>",
-                    "--ro-bind", "<ready-pipe>", "/run/workcell-network-ready",
-                    "--ro-bind-data", "<dns-fd>", resolverDestination planned]
-              else []
-            preview = "bwrap" : networkPlan ++ arguments planned
-        putStrLn $ "# " ++ unwords (map shellQuote preview)
-        when (selectedNetwork planned == PrivateNetwork) $
-          putStrLn $ "# " ++ unwords (map shellQuote $ "pasta" : pastaArguments "<netns>" "<userns>" "<pid-file>")
-        executable <- getExecutablePath
-        argv <- getArgs
-        let (options, cmd) = break (== "--") argv
-        putStrLn $ unwords $ map shellQuote $ executable : filter (/= "--dryrun") options ++ cmd
-      else putStrLn $ unwords $ map shellQuote $ "bwrap" : arguments planned
-    else do
-      needProgram "bwrap"
-      unless (shareProcesses opts) verifyProcessIsolation
-      launch <- catchIOError (do
-        verifyNetwork (selectedNetwork planned)
-          (if shareProcesses opts then [] else privateProcArgs)
-        pure planned) $ \err ->
-          if isNothing (networkOption opts) then do
-            warning "falling back to host networking"
-            prepare opts {networkOption = Just HostNetwork}
-          else ioError err
-      withSystemFiles (copiedSystemFiles launch) $ \descriptors -> do
-        let liveArgs = [fromMaybe arg (lookup index descriptors) |
-                        (index, arg) <- zip [0..] (arguments launch)]
-        whenJust (persistentHome launch) $ \dir -> do
-          unlessM (doesDirectoryExist dir) $
-            warning $ "created" +-+ dir
-          createDirectoryIfMissing True dir
-        let mode = selectedNetwork launch
-            modeName =
-              case mode of
-                PrivateNetwork -> "private"
-                HostNetwork -> "host"
-                NoNetwork -> "none"
-            details = SessionDetails (launchProject launch)
-              (if null (command opts) then ["/bin/bash"] else command opts)
-              modeName (shareProcesses opts)
-            track = withSession details
-        result <- if mode == PrivateNetwork
-          then runTrackedPrivateNetwork track [] liveArgs (resolverDestination launch)
-          else runTrackedSandbox track liveArgs
-        exitWith result
+  if dryRun opts then preview opts planned else do
+    needProgram "bwrap"
+    let mode = selectedNetwork planned
+        automatic = isNothing (networkOption opts)
+    -- Check before creating a persistent home or running the requested command.
+    failure <- probeNamespaces (not $ shareProcesses opts) (mode /= HostNetwork)
+    available <- case failure of
+      Just (ProcessIsolationUnavailable err) -> invalid $
+        "private PID namespace and /proc are unavailable in this environment. "
+        ++ "Use --share-processes only if sharing enclosing processes is acceptable.\n" ++ err
+      Just (NetworkIsolationUnavailable err) -> pure $ Just err
+      Nothing | mode == PrivateNetwork -> checkPrivateNetwork
+      Nothing -> pure Nothing
+    -- The command is still paused when private network setup fails,
+    -- so falling back cannot run it twice.
+    let unavailable reason
+          | automatic && mode == PrivateNetwork = do
+              warning $ "private networking is unavailable (" ++ takeWhile (/= '\n') reason ++
+                "): falling back to host networking"
+              prepare opts {networkOption = Just HostNetwork} >>= launch False
+          | otherwise = invalid $
+              (if mode == PrivateNetwork then "private networking" else "network isolation")
+              ++ " is unavailable. " ++ reason ++ "\n"
+              ++ "Try --network-host, if sharing the enclosing network is acceptable."
+    result <- case available of
+      Just reason -> unavailable reason
+      Nothing -> launch (not automatic) planned `catch`
+        \(NetworkSetupFailure reason) -> unavailable reason
+    exitWith result
+  where
+    launch removeHomeOnFailure plan =
+      withPersistentHome removeHomeOnFailure (persistentHome plan) $
+        runSandbox (privateNetwork plan) (withSession details) (launchSandbox plan)
+      where
+        details = SessionDetails (launchProject plan) (sandboxCommand $ launchSandbox plan)
+          (selectedNetwork plan) (shareProcesses opts)
 
-withSystemFiles :: [(Int, FilePath)] -> ([(Int, String)] -> IO a) -> IO a
-withSystemFiles [] action = action []
-withSystemFiles ((index, path):rest) action =
-  bracket (openSimpleFd path ReadOnly) closeFd $ \fd ->
-    withSystemFiles rest $ \descriptors -> action ((index, show fd) : descriptors)
+-- Undo creating a persistent home if the run fails while it is still empty,
+-- such as when sandbox or network setup fails before the command starts.
+-- Bubblewrap may already have created empty mountpoints inside it (for a
+-- project beneath HOME); remove only empty directories, never files.
+-- A fallback launch reuses the directory instead.
+withPersistentHome :: Bool -> Maybe FilePath -> IO a -> IO a
+withPersistentHome _ Nothing action = action
+withPersistentHome removeOnFailure (Just dir) action = do
+  exists <- doesDirectoryExist dir
+  if exists then action else do
+    warning $ "created" +-+ dir
+    createDirectoryIfMissing True dir
+    action `onException` when removeOnFailure (ignoreErrors $ do
+      pristine <- onlyDirectories dir
+      when pristine $ removeTree dir)
+  where
+    onlyDirectories path = do
+      symlink <- pathIsSymbolicLink path
+      isDir <- doesDirectoryExist path
+      if not isDir || symlink then pure False else
+        listDirectory path >>= allM (onlyDirectories . (path </>))
+    removeTree path = do
+      listDirectory path >>= mapM_ (removeTree . (path </>))
+      removeDirectory path
+    ignoreErrors act = catchIOError act $ const $ pure ()
+
+preview :: Options -> Launch -> IO ()
+preview opts plan = do
+  let network = privateNetwork plan
+      sandbox = launchSandbox plan
+      copies = not $ null [() | FileFd _ _ <- sandboxArgs sandbox]
+      commands = map (unwords . map shellQuote) $ previewSandbox network sandbox
+  when (isNothing $ networkOption opts) $
+    putStrLn "# trying private networking; fall back to host if network setup fails"
+  if isJust network || copies
+    then do
+      -- Descriptors only exist at launch, so show a plan and a runnable command.
+      mapM_ (putStrLn . ("# " ++)) commands
+      executable <- getExecutablePath
+      argv <- getArgs
+      let (options, cmd) = break (== "--") argv
+      putStrLn $ unwords $ map shellQuote $ executable : filter (/= "--dryrun") options ++ cmd
+    else mapM_ putStrLn commands
 
 -- Validate paths and construct argv before creating any persistent home.
 prepare :: Options -> IO Launch
@@ -170,13 +198,11 @@ prepare opts = do
     -- Files produced by --ro-bind-data have no directory entry to re-bind.
     -- Open and copy their contents into the next sandbox instead.
     pure $ if linkCount status == 0
-      then (["--ro-bind-data", "<system-file-" ++ show index ++ "-fd>", destination mount],
-            Just (index, source mount))
-      else (mountArgs mount, Nothing)
-  resolverTarget <- if mode /= PrivateNetwork then pure "/etc/resolv.conf" else do
-    let hidden path = if shareFilesystem opts then any (`within` path) temporaryRoots
-                      else not $ any (`within` path) systemDirectories
-    target <- catchIOError (hiddenSystemTarget hidden "/etc/resolv.conf") $ \err ->
+      then [Arg "--ro-bind-data", FileFd ("<system-file-" ++ show index ++ "-fd>") (source mount),
+            Arg (destination mount)]
+      else map Arg (mountArgs mount)
+  resolver <- if mode /= PrivateNetwork then pure "/etc/resolv.conf" else do
+    target <- catchIOError (hiddenSystemTarget (hiddenPath $ shareFilesystem opts) "/etc/resolv.conf") $ \err ->
       if isDoesNotExistError err then pure Nothing else ioError err
     maybe (canonicalizePath "/etc/resolv.conf") pure target
   let destinations = map destination mounts
@@ -199,17 +225,14 @@ prepare opts = do
         ++ ["--dir", home]
         ++ homeArgs
         ++ resolverArgs
-      args = beforeSystemFiles ++ concatMap fst systemMounts
-        ++ ["--unshare-net" | mode /= HostNetwork]
+      afterSystemFiles = ["--unshare-net" | mode /= HostNetwork]
         ++ concatMap mountArgs mounts
         ++ maybe [] (\path -> mountArgs $ Mount path path projectMode) project
         ++ ["--chdir", fromMaybe home project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ desktopEnv ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
-        ++ ["--"] ++ cmd
-      copies = [(length beforeSystemFiles + index * 3 + 1, path) |
-                 (index, path) <- mapMaybe snd systemMounts]
-  pure $ Launch args suppliedHome mode resolverTarget copies project
+      args = map Arg beforeSystemFiles ++ concat systemMounts ++ map Arg afterSystemFiles
+  pure $ Launch (Sandbox args cmd) suppliedHome mode resolver project
 
 waylandSetup :: IO ([Mount], [(String, String)])
 waylandSetup = do
@@ -289,16 +312,6 @@ dbusSetup = do
 privateProcArgs :: [String]
 privateProcArgs = ["--unshare-pid", "--proc", "/proc"]
 
--- Check before creating a persistent home or running the requested command.
-verifyProcessIsolation :: IO ()
-verifyProcessIsolation = do
-  (ok, _, err) <- cmdFull "bwrap"
-    (["--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev"]
-     ++ privateProcArgs ++ ["--", "/bin/true"]) ""
-  unless ok $ invalid $
-    "private PID namespace and /proc are unavailable in this environment. "
-    ++ "Use --share-processes only if sharing enclosing processes is acceptable.\n" ++ err
-
 defaultPath :: FilePath -> String
 defaultPath home = intercalate ":"
   [home </> ".local/bin", home </> "bin",
@@ -344,10 +357,8 @@ liveResolverArgs shared mounts = do
   if not exists then pure [] else do
     resolved <- canonicalizePath "/etc/resolv.conf"
     let directory = takeDirectory resolved
-        hidden path = if shared then any (`within` path) temporaryRoots
-                      else not $ any (`within` path) systemDirectories
         covered path = any (\mount -> within (destination mount) path) mounts
-    target <- hiddenSystemTarget hidden "/etc/resolv.conf"
+    target <- hiddenSystemTarget (hiddenPath shared) "/etc/resolv.conf"
     status <- getFileStatus resolved
     pure $ case target of
       Just dest | directory `elem` ["/run/systemd/resolve", "/run/host/run/systemd/resolve"]
@@ -365,10 +376,14 @@ preservedSystemFiles shared preserveResolver = fmap concat $ forM
   exists <- doesPathExist path
   if not exists then pure [] else do
     resolved <- canonicalizePath path
-    let hidden target = if shared then any (`within` target) temporaryRoots
-                        else not $ any (`within` target) systemDirectories
-    target <- hiddenSystemTarget hidden path
+    target <- hiddenSystemTarget (hiddenPath shared) path
     pure $ maybe [] (\dest -> [Mount resolved dest ReadOnlyMount]) target
+
+-- Paths outside the sandbox's view of the enclosing filesystem.
+hiddenPath :: Bool -> FilePath -> Bool
+hiddenPath shared path
+  | shared = any (`within` path) temporaryRoots
+  | otherwise = not $ any (`within` path) systemDirectories
 
 -- Stop at the first hidden part of a symlink chain. Its final target may be
 -- exposed under /usr, while an intermediate link under /run is still hidden.
@@ -489,12 +504,3 @@ resolveEnvironment spec = do
 
 rejectRoot :: String -> FilePath -> IO ()
 rejectRoot label path = when (path == "/") $ invalid $ label ++ " must not be /"
-
-invalid :: String -> IO a
-invalid = ioError . userError
-
-shellQuote :: String -> String
-shellQuote value = "'" ++ concatMap escape value ++ "'"
-  where
-    escape '\'' = "'\\''"
-    escape c = [c]
