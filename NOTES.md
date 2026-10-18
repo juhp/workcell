@@ -293,6 +293,12 @@ with the command paused; workcell attaches pasta to it, waits for network setup,
 then releases the command. Workcell supervises both processes, returns the
 command's exit status, and stops the sandbox if the helper exits unexpectedly.
 Both processes are cleaned up when the command exits or workcell is terminated.
+Under an enforcing SELinux policy (passt-selinux on a Fedora host), pasta runs
+confined and may not watch the sandbox's `/proc` entry, so workcell passes
+`--no-netns-quit` and relies on stopping pasta itself; a pasta helper could
+therefore outlive a workcell killed with SIGKILL. Inside Toolbx, where SELinux
+is not visible and pasta is unconfined, pasta also quits on its own when the
+sandbox ends.
 
 Workcell captures pasta diagnostics through a pipe and writes a separate
 owner-readable log for each run under

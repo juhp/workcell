@@ -169,9 +169,14 @@ withNetwork (Just (config, logHandle)) dir pid child action = do
   bracket (setupFailure "cannot open sandbox network namespace" $ openSimpleFd childNet ReadOnly) closeFd $ \netFd ->
     bracket (setupFailure "cannot find network namespace owner" $ ownerNamespace netFd) closeFd $ \userFd -> do
       supervisor <- getProcessID
+      confined <- selinuxEnforcing
       let reference fd = "/proc" </> show supervisor </> "fd" </> show fd
           pidfile = dir </> "pasta.pid"
-          helper = (proc "pasta" (pastaExtraArgs config ++
+          -- Pasta watches the directory holding its netns path to quit with
+          -- the sandbox. Its SELinux policy (passt-selinux) forbids opening
+          -- another process's /proc/PID/ns, so skip the watch when confined:
+          -- workcell stops pasta itself when the command exits.
+          helper = (proc "pasta" (pastaExtraArgs config ++ ["--no-netns-quit" | confined] ++
             pastaArguments childNet (reference userFd) pidfile))
             {std_in = NoStream, std_out = NoStream, std_err = CreatePipe, close_fds = True}
       withPastaChild logHandle helper $ \pasta -> do
@@ -185,6 +190,12 @@ withNetwork (Just (config, logHandle)) dir pid child action = do
   where
     setupFailure message act = act `catchIOError` \err ->
       throwIO $ NetworkSetupFailure $ message ++ ": " ++ ioeGetErrorString err
+
+-- SELinux is hidden (and pasta unconfined) inside typical toolbox containers.
+selinuxEnforcing :: IO Bool
+selinuxEnforcing = catchIOError
+  ((== "1") . takeWhile (/= '\n') . BSC.unpack <$> BS.readFile "/sys/fs/selinux/enforce")
+  (const $ pure False)
 
 waitReady :: FilePath -> Child -> Child -> IO ()
 waitReady pidfile child helper = do
