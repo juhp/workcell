@@ -1,29 +1,29 @@
 cabal-version:       2.2
 name:                workcell
 version:             0.1.0
-synopsis:            Project isolation using bubblewrap
+synopsis:            Linux tool and project isolation using bubblewrap
 description:
-        Run installed system tools with a read-only filesystem,
-        isolated home, and explicit writable project access.
+        Run tools with a read-only filesystem, isolated home,
+        and explicit writable project access.
 license:             LGPL-2.1-or-later
 license-file:        COPYING.md
 author:              Jens Petersen <juhpetersen@gmail.com>
 maintainer:          Jens Petersen <juhpetersen@gmail.com>
 copyright:           2026  Jens Petersen <juhpetersen@gmail.com>
-category:            Unclassified
+category:            Utility
 homepage:            https://github.com/juhp/workcell
 bug-reports:         https://github.com/juhp/workcell/issues
 build-type:          Simple
 extra-doc-files:     README.md
                      ChangeLog.md
--- tested-with:         GHC == 8.10.7
---                       || == 9.0.2
---                       || == 9.2.8
---                       || == 9.4.8
---                       || == 9.6.7
---                       || == 9.8.4
---                       || == 9.10.3
---                       || == 9.12.4
+tested-with:         GHC == 8.10.7
+                      || == 9.0.2
+                      || == 9.2.8
+                      || == 9.4.8
+                      || == 9.6.7
+                      || == 9.8.4
+                      || == 9.10.3
+                      || == 9.12.4
 
 source-repository head
   type:                git
