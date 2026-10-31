@@ -1,6 +1,6 @@
 cabal-version:       2.2
 name:                workcell
-version:             0.1.0
+version:             0.1.1
 synopsis:            Linux tool and project isolation using bubblewrap
 description:
         Run tools with a read-only filesystem, isolated home,
@@ -33,6 +33,7 @@ executable workcell
   main-is:             Main.hs
   other-modules:       Child
                        Enter
+                       Identity
                        Run
                        Sandbox
                        Session
@@ -71,6 +72,7 @@ test-suite integration
   main-is:             Spec.hs
   hs-source-dirs:      test src
   other-modules:       Child
+                       Identity
                        Sandbox
                        Session
                        Util

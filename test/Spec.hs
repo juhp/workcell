@@ -1,4 +1,6 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 -- SPDX-License-Identifier: LGPL-2.1-or-later
 module Main (main) where
 
@@ -18,18 +20,28 @@ import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv
 import System.Exit (ExitCode(..), die, exitWith)
 import System.FilePath ((</>), takeDirectory)
 import System.IO (hClose, hFlush, hGetLine, hPutStr, hPutStrLn)
+import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (fileMode, fileOwner, getFileStatus, readSymbolicLink, setFileMode)
 import Data.Bits ((.&.))
 import qualified System.Posix.IO as Posix
 import System.Posix.Temp (mkdtemp)
 import System.Posix.Terminal (openPseudoTerminal)
-import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
+#if MIN_VERSION_unix(2,8,0)
+import System.Posix.User.ByteString (UserEntry, GroupEntry)
+import System.Posix.User (pattern UserEntry, pattern GroupEntry, userName, groupName,
+                          getEffectiveGroupID, getEffectiveUserID,
+                          getUserEntryForID, getGroupEntryForID)
+#else
+import System.Posix.User (UserEntry(..), GroupEntry(..), getEffectiveGroupID, getEffectiveUserID,
+                          getUserEntryForID, getGroupEntryForID)
+#endif
 import System.Posix.Signals (Handler(CatchOnce), installHandler, signalProcess, sigKILL, sigTERM)
 import System.Process hiding (shell)
 import System.Timeout (timeout)
 import Test.Hspec
 
 import qualified Sandbox as WorkcellSandbox
+import qualified Identity as WorkcellIdentity
 import qualified Session as WorkcellSession
 import qualified Util as WorkcellUtil
 
@@ -43,10 +55,27 @@ data Context = Context
   , home :: FilePath
   }
 
+directoryUser :: UserEntry
+directoryUser = UserEntry "workcell-nss-test" "secret" 424242 424242
+  "Directory User" "/home/directory" "/bin/bash"
+
+directoryGroup :: GroupEntry
+directoryGroup = GroupEntry "workcell-nss-test" "secret" 424242 ["workcell-nss-test"]
+
 main :: IO ()
 main = do
   args <- getArgs
   case args of
+    "--test-identity-files":bwrapArgs -> withTestTermination $ do
+      let sandbox = testSandbox bwrapArgs
+          snapshots = concat
+            [[WorkcellSandbox.Arg "--ro-bind-data", WorkcellSandbox.DataFd name (BSC.pack content),
+              WorkcellSandbox.Arg path]
+            | (path, name, content) <-
+              [("/etc/passwd", "<passwd-fd>", WorkcellIdentity.passwdEntries [directoryUser] "root:x:0:0::/root:/bin/sh\n"),
+               ("/etc/group", "<group-fd>", WorkcellIdentity.groupEntries [directoryGroup] "root:x:0:\n")]]
+      WorkcellSandbox.runSandbox Nothing WorkcellSandbox.untracked
+        sandbox {WorkcellSandbox.sandboxArgs = WorkcellSandbox.sandboxArgs sandbox ++ snapshots} >>= exitWith
     "--test-tracked-loopback-network":bwrapArgs -> withTestTermination $
       WorkcellSandbox.runSandbox loopbackNetwork
         (WorkcellSession.withSession $ WorkcellSession.SessionDetails Nothing ["sleep", "30"]
@@ -150,6 +179,43 @@ shell ctx script args = do
 
 spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
+  it "adds directory accounts absent from local passwd and group files" $ \_ -> do
+    WorkcellIdentity.passwdEntries [directoryUser] "root:x:0:0::/root:/bin/sh" `shouldBe`
+      "root:x:0:0::/root:/bin/sh\nworkcell-nss-test:x:424242:424242:Directory User:/home/directory:/bin/bash\n"
+    WorkcellIdentity.groupEntries [directoryGroup] "root:x:0:\n" `shouldBe`
+      "root:x:0:\nworkcell-nss-test:x:424242:workcell-nss-test\n"
+    WorkcellIdentity.passwdEntries [directoryUser] "" `shouldBe`
+      "workcell-nss-test:x:424242:424242:Directory User:/home/directory:/bin/bash\n"
+
+  it "preserves existing local identities and does not duplicate snapshots" $ \_ -> do
+    let passwd = "local:x:424242:12:Local User:/home/local:/bin/sh\n"
+        group = "local:x:424242:local\n"
+        snapshot = WorkcellIdentity.passwdEntries [directoryUser] ""
+    WorkcellIdentity.passwdEntries [directoryUser] passwd `shouldBe` passwd
+    WorkcellIdentity.groupEntries [directoryGroup] group `shouldBe` group
+    WorkcellIdentity.passwdEntries [directoryUser] snapshot `shouldBe` snapshot
+
+  it "resolves snapshotted directory identities with host service paths hidden" $ \_ -> do
+    executable <- getExecutablePath
+    let flags = ["--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/run",
+                 "--tmpfs", "/var", "--", "/bin/sh", "-ec",
+                 "id -u workcell-nss-test; getent group 424242; " ++
+                 "! (printf changed > /etc/passwd); ! (printf changed > /etc/group)"]
+    out <- successful =<< capture (proc executable ("--test-identity-files" : flags))
+    out `shouldBe` "424242\nworkcell-nss-test:x:424242:workcell-nss-test\n"
+
+  it "preserves the invoking host user and group names" $ \ctx -> do
+    uid <- getEffectiveUserID
+    gid <- getEffectiveGroupID
+    account <- catchIOError
+      (Just <$> ((,) <$> getUserEntryForID uid <*> getGroupEntryForID gid)) $ \err ->
+        if isDoesNotExistError err then pure Nothing else ioError err
+    case account of
+      Nothing -> pendingWith "invoking account names are already unavailable outside workcell"
+      Just (user, group) -> do
+        success ctx ["--", "id", "-un"] `shouldReturn` userName user ++ "\n"
+        success ctx ["--", "id", "-gn"] `shouldReturn` groupName group ++ "\n"
+
   it "enters no unknown session" $ \ctx -> do
     sessionInvoke ctx ["list"] >>= successful >>= (`shouldBe` "")
     (code1, _, emptyError) <- sessionInvoke ctx ["enter"]

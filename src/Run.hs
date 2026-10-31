@@ -20,11 +20,12 @@ import System.Directory
    removeDirectory)
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (exitWith)
-import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory)
+import System.FilePath ((</>), isAbsolute, normalise, splitDirectories, takeDirectory, takeFileName)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, isRegularFile, isSocket, linkCount)
 
 import Sandbox
+import Identity (identityFiles)
 import Session (SessionDetails(..), withSession)
 import Util (invalid, shellQuote)
 
@@ -69,7 +70,9 @@ privateNetwork launch
 runWorkcell :: Options -> IO ()
 runWorkcell opts = do
   planned <- prepare opts
-  if dryRun opts then preview opts planned else do
+  if dryRun opts
+    then preview opts planned
+    else do
     needProgram "bwrap"
     let mode = selectedNetwork planned
         automatic = isNothing (networkOption opts)
@@ -136,7 +139,9 @@ preview :: Options -> Launch -> IO ()
 preview opts plan = do
   let network = privateNetwork plan
       sandbox = launchSandbox plan
-      copies = not $ null [() | FileFd _ _ <- sandboxArgs sandbox]
+      descriptor (Arg _) = False
+      descriptor _ = True
+      copies = any descriptor (sandboxArgs sandbox)
       commands = map (unwords . map shellQuote) $ previewSandbox network sandbox
   when (isNothing $ networkOption opts) $
     putStrLn "# trying private networking; fall back to host if network setup fails"
@@ -176,6 +181,8 @@ prepare opts = do
       desktopEnv = concatMap snd desktopSettings ++
         [("GDK_BACKEND", intercalate "," backends) | not (null backends)]
   mounts <- (desktopMounts ++) <$> mapM resolveMount (volumeOptions opts)
+  identities <- filter (\(path, _) -> not $
+    any (\mount -> within (destination mount) path) mounts) <$> identityFiles
   unless (shareProcesses opts) $ do
     when (maybe False (within "/proc") project || within home "/proc" || within "/proc" home) $
       invalid "home and project must not overlap private /proc"
@@ -231,7 +238,10 @@ prepare opts = do
         ++ ["--chdir", fromMaybe home project, "--clearenv"]
         ++ concatMap (\(key, value) -> ["--setenv", key, value]) (defaults ++ desktopEnv ++ env)
         ++ (if shareFilesystem opts then [] else ["--remount-ro", "/"])
-      args = map Arg beforeSystemFiles ++ concat systemMounts ++ map Arg afterSystemFiles
+      identityArgs = concat
+        [[Arg "--ro-bind-data", DataFd ("<" ++ name ++ "-fd>") bytes, Arg path]
+        | (path, bytes) <- identities, let name = takeFileName path]
+      args = map Arg beforeSystemFiles ++ concat systemMounts ++ identityArgs ++ map Arg afterSystemFiles
   pure $ Launch (Sandbox args cmd) suppliedHome mode resolver project
 
 waylandSetup :: IO ([Mount], [(String, String)])

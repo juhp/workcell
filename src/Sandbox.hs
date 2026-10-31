@@ -69,7 +69,7 @@ instance FromJSON NetworkMode where
 
 -- A bubblewrap option word, or a file whose contents bubblewrap reads from
 -- a descriptor opened at launch (shown by its placeholder in previews).
-data Arg = Arg String | FileFd String FilePath
+data Arg = Arg String | FileFd String FilePath | DataFd String BS.ByteString
 
 data Sandbox = Sandbox
   { sandboxArgs :: [Arg]
@@ -123,6 +123,7 @@ previewSandbox network sandbox =
   where
     render (Arg value) = value
     render (FileFd placeholder _) = placeholder
+    render (DataFd placeholder _) = placeholder
     supervision = if isJust network then ["--info-fd", "<info-fd>"] else []
     networkArgs = case network of
       Just config -> ["--ro-bind-data", "<dns-fd>", resolverDestination config,
@@ -224,14 +225,22 @@ withRuntimeDirectory action = do
   bracket (mkdtemp $ base </> "workcell-session-") removePathForcibly action
 
 withArgDescriptors :: [Arg] -> ([String] -> [Fd] -> IO a) -> IO a
-withArgDescriptors args action =
-  withDescriptors [path | FileFd _ path <- args] $ \fds ->
-    action (resolve args fds) fds
+withArgDescriptors args action = open args [] []
   where
-    resolve (Arg value : rest) fds = value : resolve rest fds
-    resolve (FileFd _ _ : rest) (fd:fds) = show fd : resolve rest fds
-    resolve (FileFd _ path : _) [] = error $ "unopened descriptor for " ++ path
-    resolve [] _ = []
+    open [] values fds = action (reverse values) (reverse fds)
+    open (Arg value : rest) values fds = open rest (value:values) fds
+    open (FileFd _ path : rest) values fds =
+      bracket (openSimpleFd path ReadOnly) closeFd $ \fd ->
+        open rest (show fd:values) (fd:fds)
+    open (DataFd _ bytes : rest) values fds = do
+      base <- getTemporaryDirectory
+      bracket (openBinaryTempFile base "workcell-identity-") cleanup $ \(path, handle) -> do
+        BS.hPut handle bytes
+        hSeek handle AbsoluteSeek 0
+        removeFile path
+        bracket (handleToFd handle) closeFd $ \fd ->
+          open rest (show fd:values) (fd:fds)
+    cleanup (path, handle) = hClose handle >> ignoreMissing (removeFile path)
 
 withPipe :: ((Fd, Handle, Handle) -> IO a) -> IO a
 withPipe = bracket acquire release

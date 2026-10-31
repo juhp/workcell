@@ -80,6 +80,12 @@ falls back to host networking if its setup fails.
 Workcell will print a warning before launching the command.
 `--network-private` requires successful private setup.
 
+User and group names are resolved before isolation. For SSSD and other
+directory accounts, workcell adds missing entries for the invoking
+user and groups to read-only sandbox copies of `/etc/passwd` and
+`/etc/group`. Local entries remain intact. Names must be resolvable in
+the enclosing environment when workcell starts.
+
 ### `list` and `enter` commands
 
 Use `workcell list` to list running workcell sessions.
