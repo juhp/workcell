@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: LGPL-2.1-or-later
 module Identity (identityFiles, passwdEntries, groupEntries, appendLines) where
 
-import Control.Monad (forM, unless)
+import Control.Monad (forM, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.List (intercalate, nub)
@@ -11,10 +11,13 @@ import GHC.Foreign (withCStringLen)
 import GHC.IO.Encoding (getFileSystemEncoding)
 import SimpleCmd (warning)
 import System.IO.Error (catchIOError, isDoesNotExistError)
+import System.Posix.Files (getFileStatus, linkCount)
 import System.Posix.User
 #if MIN_VERSION_unix(2,8,0)
 import System.Posix.User.ByteString (UserEntry, GroupEntry)
 #endif
+
+import Util (invalid)
 
 -- Resolve NSS records while the host's SSSD socket/cache is still visible.
 -- Retain local accounts, and copy no password hashes or remote directory dump.
@@ -33,6 +36,11 @@ identityFiles = do
       if isDoesNotExistError err then pure BS.empty else ioError err
     -- Decode no existing bytes: only encode the added NSS records.
     added <- withCStringLen encoding (unlines $ missing original) BS.packCStringLen
+    -- An enclosing sandbox's --ro-bind-data copy cannot be mounted over.
+    unless (BS.null added) $ do
+      status <- getFileStatus path
+      when (linkCount status == 0) $
+        invalid $ path ++ " is a sandbox copy which cannot be replaced"
     pure (path, original, added)
   pure [(path, appendLines original added)
        | Just (path, original, added) <- files, not (BS.null added)]
