@@ -202,8 +202,10 @@ spec = describe "workcell CLI" $ do
 
   it "resolves snapshotted directory identities with host service paths hidden" $ \_ -> do
     executable <- getExecutablePath
+    -- Replace /etc: an enclosing workcell's /etc/passwd copy cannot be mounted over.
     let flags = ["--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/run",
-                 "--tmpfs", "/var", "--", "/bin/sh", "-ec",
+                 "--tmpfs", "/var", "--tmpfs", "/etc",
+                 "--ro-bind", "/etc/nsswitch.conf", "/etc/nsswitch.conf", "--", "/bin/sh", "-ec",
                  "id -u workcell-nss-test; getent group 424242; " ++
                  "! (printf changed > /etc/passwd); ! (printf changed > /etc/group)"]
     out <- successful =<< capture (proc executable ("--test-identity-files" : flags))
