@@ -156,7 +156,9 @@ Linux
 
 ## Installation
 
-todo: workcell is packaged in Fedora Copr
+workcell is packaged in Fedora Copr:
+
+<https://copr.fedorainfracloud.org/coprs/petersen/workcell/>
 
 ## Building
 
