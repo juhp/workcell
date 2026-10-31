@@ -62,6 +62,11 @@ directoryUser = UserEntry "workcell-nss-test" "secret" 424242 424242
 directoryGroup :: GroupEntry
 directoryGroup = GroupEntry "workcell-nss-test" "secret" 424242 ["workcell-nss-test"]
 
+-- ASCII test records need no filesystem encoding.
+withEntries :: (BS.ByteString -> [String]) -> BS.ByteString -> BS.ByteString
+withEntries missing original =
+  WorkcellIdentity.appendLines original (BSC.pack $ unlines $ missing original)
+
 main :: IO ()
 main = do
   args <- getArgs
@@ -69,11 +74,11 @@ main = do
     "--test-identity-files":bwrapArgs -> withTestTermination $ do
       let sandbox = testSandbox bwrapArgs
           snapshots = concat
-            [[WorkcellSandbox.Arg "--ro-bind-data", WorkcellSandbox.DataFd name (BSC.pack content),
+            [[WorkcellSandbox.Arg "--ro-bind-data", WorkcellSandbox.DataFd name content,
               WorkcellSandbox.Arg path]
             | (path, name, content) <-
-              [("/etc/passwd", "<passwd-fd>", WorkcellIdentity.passwdEntries [directoryUser] "root:x:0:0::/root:/bin/sh\n"),
-               ("/etc/group", "<group-fd>", WorkcellIdentity.groupEntries [directoryGroup] "root:x:0:\n")]]
+              [("/etc/passwd", "<passwd-fd>", withEntries (WorkcellIdentity.passwdEntries [directoryUser]) "root:x:0:0::/root:/bin/sh\n"),
+               ("/etc/group", "<group-fd>", withEntries (WorkcellIdentity.groupEntries [directoryGroup]) "root:x:0:\n")]]
       WorkcellSandbox.runSandbox Nothing WorkcellSandbox.untracked
         sandbox {WorkcellSandbox.sandboxArgs = WorkcellSandbox.sandboxArgs sandbox ++ snapshots} >>= exitWith
     "--test-tracked-loopback-network":bwrapArgs -> withTestTermination $
@@ -180,20 +185,20 @@ shell ctx script args = do
 spec :: SpecWith Context
 spec = describe "workcell CLI" $ do
   it "adds directory accounts absent from local passwd and group files" $ \_ -> do
-    WorkcellIdentity.passwdEntries [directoryUser] "root:x:0:0::/root:/bin/sh" `shouldBe`
+    withEntries (WorkcellIdentity.passwdEntries [directoryUser]) "root:x:0:0::/root:/bin/sh" `shouldBe`
       "root:x:0:0::/root:/bin/sh\nworkcell-nss-test:x:424242:424242:Directory User:/home/directory:/bin/bash\n"
-    WorkcellIdentity.groupEntries [directoryGroup] "root:x:0:\n" `shouldBe`
+    withEntries (WorkcellIdentity.groupEntries [directoryGroup]) "root:x:0:\n" `shouldBe`
       "root:x:0:\nworkcell-nss-test:x:424242:workcell-nss-test\n"
-    WorkcellIdentity.passwdEntries [directoryUser] "" `shouldBe`
+    withEntries (WorkcellIdentity.passwdEntries [directoryUser]) "" `shouldBe`
       "workcell-nss-test:x:424242:424242:Directory User:/home/directory:/bin/bash\n"
 
   it "preserves existing local identities and does not duplicate snapshots" $ \_ -> do
     let passwd = "local:x:424242:12:Local User:/home/local:/bin/sh\n"
         group = "local:x:424242:local\n"
-        snapshot = WorkcellIdentity.passwdEntries [directoryUser] ""
-    WorkcellIdentity.passwdEntries [directoryUser] passwd `shouldBe` passwd
-    WorkcellIdentity.groupEntries [directoryGroup] group `shouldBe` group
-    WorkcellIdentity.passwdEntries [directoryUser] snapshot `shouldBe` snapshot
+        snapshot = withEntries (WorkcellIdentity.passwdEntries [directoryUser]) ""
+    WorkcellIdentity.passwdEntries [directoryUser] passwd `shouldBe` []
+    WorkcellIdentity.groupEntries [directoryGroup] group `shouldBe` []
+    WorkcellIdentity.passwdEntries [directoryUser] snapshot `shouldBe` []
 
   it "resolves snapshotted directory identities with host service paths hidden" $ \_ -> do
     executable <- getExecutablePath
