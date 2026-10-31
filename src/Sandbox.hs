@@ -34,7 +34,7 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), isAbsolute)
 import System.IO
-  (Handle, IOMode(..), SeekMode(..), hClose, hFileSize, hFlush, hPutStr, hSeek,
+  (Handle, IOMode(..), SeekMode(..), hClose, hFileSize, hFlush, hSeek,
    openBinaryTempFile, withBinaryFile)
 import System.IO.Error (catchIOError, ioeGetErrorString)
 import System.Posix.IO (OpenMode(..), closeFd, createPipe, fdToHandle, fdWrite, handleToFd)
@@ -232,15 +232,23 @@ withArgDescriptors args action = open args [] []
     open (FileFd _ path : rest) values fds =
       bracket (openSimpleFd path ReadOnly) closeFd $ \fd ->
         open rest (show fd:values) (fd:fds)
-    open (DataFd _ bytes : rest) values fds = do
-      base <- getTemporaryDirectory
-      bracket (openBinaryTempFile base "workcell-identity-") cleanup $ \(path, handle) -> do
-        BS.hPut handle bytes
-        hSeek handle AbsoluteSeek 0
-        removeFile path
-        bracket (handleToFd handle) closeFd $ \fd ->
-          open rest (show fd:values) (fd:fds)
-    cleanup (path, handle) = hClose handle >> ignoreMissing (removeFile path)
+    open (DataFd _ bytes : rest) values fds =
+      withDataFd "workcell-data-" bytes $ \fd ->
+        open rest (show fd:values) (fd:fds)
+
+-- An unlinked temporary file holding the bytes, for bubblewrap to read.
+withDataFd :: String -> BS.ByteString -> (Fd -> IO a) -> IO a
+withDataFd prefix bytes action = do
+  base <- getTemporaryDirectory
+  bracket (openBinaryTempFile base prefix) cleanup $ \(path, handle) -> do
+    BS.hPut handle bytes
+    hSeek handle AbsoluteSeek 0
+    removeFile path
+    bracket (handleToFd handle) closeFd action
+  where
+    cleanup (path, handle) = do
+      hClose handle
+      ignoreMissing $ removeFile path
 
 withPipe :: ((Fd, Handle, Handle) -> IO a) -> IO a
 withPipe = bracket acquire release
@@ -257,21 +265,13 @@ withPipe = bracket acquire release
 withResolver :: Maybe PrivateNetwork -> ([String] -> [Fd] -> IO a) -> IO a
 withResolver Nothing action = action [] []
 withResolver (Just config) action = do
-  base <- getTemporaryDirectory
-  bracket (openBinaryTempFile base "workcell-resolv-") cleanup $ \(path, handle) -> do
-    config' <- readResolvConf
-    let preserve line = case words line of
-          key:_ -> key `elem` ["search", "domain", "options"]
-          _ -> False
-    hPutStr handle $ unlines $ "nameserver 169.254.1.1" : filter preserve config'
-    hSeek handle AbsoluteSeek 0
-    removeFile path
-    bracket (handleToFd handle) closeFd $ \fd ->
+  config' <- readResolvConf
+  let preserve line = case words line of
+        key:_ -> key `elem` ["search", "domain", "options"]
+        _ -> False
+  withDataFd "workcell-resolv-"
+    (BSC.pack $ unlines $ "nameserver 169.254.1.1" : filter preserve config') $ \fd ->
       action ["--ro-bind-data", show fd, resolverDestination config] [fd]
-  where
-    cleanup (path, handle) = do
-      hClose handle
-      ignoreMissing $ removeFile path
 
 -- Workcell writes the state log itself: a confined pasta may be unable to
 -- write an inherited file in HOME, while writing to a pipe is permitted.
