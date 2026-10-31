@@ -62,10 +62,8 @@ directoryUser = UserEntry "workcell-nss-test" "secret" 424242 424242
 directoryGroup :: GroupEntry
 directoryGroup = GroupEntry "workcell-nss-test" "secret" 424242 ["workcell-nss-test"]
 
--- ASCII test records need no filesystem encoding.
 withEntries :: (BS.ByteString -> [String]) -> BS.ByteString -> BS.ByteString
-withEntries missing original =
-  WorkcellIdentity.appendLines original (BSC.pack $ unlines $ missing original)
+withEntries missing original = WorkcellIdentity.appendEntries original (missing original)
 
 main :: IO ()
 main = do
@@ -191,6 +189,13 @@ spec = describe "workcell CLI" $ do
       "root:x:0:\nworkcell-nss-test:x:424242:workcell-nss-test\n"
     withEntries (WorkcellIdentity.passwdEntries [directoryUser]) "" `shouldBe`
       "workcell-nss-test:x:424242:424242:Directory User:/home/directory:/bin/bash\n"
+
+  it "copies directory account bytes without re-encoding them" $ \_ -> do
+    -- NSS strings hold one Char per byte: these are the UTF-8 bytes of "é".
+    let user = UserEntry "workcell-nss-test" "secret" 424242 424242
+          "Peters\195\169n" "/home/directory" "/bin/bash"
+    withEntries (WorkcellIdentity.passwdEntries [user]) "" `shouldBe`
+      "workcell-nss-test:x:424242:424242:Peters\195\169n:/home/directory:/bin/bash\n"
 
   it "preserves existing local identities and does not duplicate snapshots" $ \_ -> do
     let passwd = "local:x:424242:12:Local User:/home/local:/bin/sh\n"

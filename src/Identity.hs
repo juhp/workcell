@@ -1,14 +1,12 @@
 {-# LANGUAGE CPP #-}
 -- SPDX-License-Identifier: LGPL-2.1-or-later
-module Identity (identityFiles, passwdEntries, groupEntries, appendLines) where
+module Identity (identityFiles, passwdEntries, groupEntries, appendEntries) where
 
 import Control.Monad (forM, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.List (intercalate, nub)
 import Data.Maybe (catMaybes, maybeToList)
-import GHC.Foreign (withCStringLen)
-import GHC.IO.Encoding (getFileSystemEncoding)
 import SimpleCmd (warning)
 import System.IO.Error (catchIOError, isDoesNotExistError)
 import System.Posix.Files (getFileStatus, linkCount)
@@ -29,21 +27,19 @@ identityFiles = do
   supplementary <- getGroups
   groups <- catMaybes <$> mapM (optional . getGroupEntryForID)
     (nub $ gid : supplementary ++ map userGroupID (maybeToList user))
-  encoding <- getFileSystemEncoding
   files <- forM [("/etc/passwd", passwdEntries $ maybeToList user),
                  ("/etc/group", groupEntries groups)] $ \(path, missing) -> optional $ do
     original <- catchIOError (BS.readFile path) $ \err ->
       if isDoesNotExistError err then pure BS.empty else ioError err
-    -- Decode no existing bytes: only encode the added NSS records.
-    added <- withCStringLen encoding (unlines $ missing original) BS.packCStringLen
+    let entries = missing original
     -- An enclosing sandbox's --ro-bind-data copy cannot be mounted over.
-    unless (BS.null added) $ do
+    unless (null entries) $ do
       status <- getFileStatus path
       when (linkCount status == 0) $
         invalid $ path ++ " is a sandbox copy which cannot be replaced"
-    pure (path, original, added)
-  pure [(path, appendLines original added)
-       | Just (path, original, added) <- files, not (BS.null added)]
+    pure (path, original, entries)
+  pure [(path, appendEntries original entries)
+       | Just (path, original, entries) <- files, not (null entries)]
   where
     -- Names are a convenience: never let a directory failure block a launch.
     optional action = catchIOError (Just <$> action) $ \err -> do
@@ -72,7 +68,11 @@ missingEntries entries original =
   where
     existing = [ident | _:_:ident:_ <- map (BSC.split ':') (BSC.lines original)]
 
-appendLines :: BS.ByteString -> BS.ByteString -> BS.ByteString
-appendLines original added
+-- The unix package unpacks NSS strings one Char per byte, so packing them
+-- restores the directory's bytes in whatever encoding it uses.
+appendEntries :: BS.ByteString -> [String] -> BS.ByteString
+appendEntries original entries
   | BS.null original || BSC.last original == '\n' = original `BS.append` added
   | otherwise = BSC.snoc original '\n' `BS.append` added
+  where
+    added = BSC.pack $ unlines entries
