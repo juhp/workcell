@@ -47,6 +47,10 @@ identityFiles = do
         warning $ "cannot preserve account names: " ++ show err
       pure Nothing
 
+-- Directory values are copied unchecked: a ':' or newline (e.g. in a GECOS
+-- display name), or a ',' in a group member, would shift or add fields.
+-- Only the sandbox's read-only copies are affected.
+
 -- Records for users whose UID is absent from the original passwd file.
 passwdEntries :: [UserEntry] -> BS.ByteString -> [String]
 passwdEntries users = missingEntries
