@@ -12,7 +12,7 @@ networking using pasta, falling back to host networking if it fails.
 `$ workcell --version`
 
 ```
-0.1.0
+0.1.1
 ```
 
 `$ workcell --help`
@@ -75,16 +75,15 @@ Available options:
   -h,--help                Show this help text
 ```
 
-Default networking tries to set up private networking but
-falls back to host networking if its setup fails.
+Default networking tries to set up private networking
+but falls back to host networking if its setup fails.
 Workcell will print a warning before launching the command.
 `--network-private` requires successful private setup.
 
-User and group names are resolved before isolation. For SSSD and other
-directory accounts, workcell adds missing entries for the invoking
-user and groups to read-only sandbox copies of `/etc/passwd` and
-`/etc/group`. Local entries remain intact. Names must be resolvable in
-the enclosing environment when workcell starts.
+User and group names are resolved before isolation.
+For SSSD and other directory accounts, workcell adds missing entries
+for the invoking user and groups to read-only sandbox copies of
+`/etc/passwd` and `/etc/group`.
 
 ### `list` and `enter` commands
 
@@ -105,7 +104,7 @@ Available options:
   -h,--help                Show this help text
 ```
 NB Ending the `run` session first currently kills any `enter` one running.
-This should be improved later. Recommend running tmux inside workcell.
+This could be improved later. Recommend running tmux inside workcell instead.
 
 ## Examples
 

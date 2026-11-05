@@ -22,7 +22,7 @@ main =
   execute <$> subcommands
     [ Subcommand "list" "List active workcells in this PID namespace" $
       pure listSessions
-    , Subcommand "enter" "Enter an active workcell without sudo" $
+    , Subcommand "enter" "Enter an active workcell" $
       enterSession
       <$> switchLongWith "dryrun" "Print the entry command without entering"
       <*> optional (strArg "SESSION")
